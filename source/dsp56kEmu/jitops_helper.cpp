@@ -477,14 +477,109 @@ namespace dsp56k
 		m_asm.and_(r64(_dst.get()), 0x00ffffff);
 	}
 
+	void JitOps::ccr_s_update(const JitReg64& _alu)
+	{
+		// Sticky S is an OR of the old flag and the selected adjacent-bit XOR.
+		// Use pooled temporaries, without branches that could skip pool spills.
+		m_ccrRead |= CCR_S;
+		updateDirtyCCR(CCR_S);
+		const DSPRegTemp result(m_block, true), adjacent(m_block, true);
+		m_asm.mov(r64(adjacent), _alu);
+		m_asm.shr(r64(adjacent), asmjit::Imm(1));
+		m_asm.mov(r64(result), _alu);
+		m_asm.xor_(r64(result), r64(adjacent));
+		if(const auto* mode = m_block.getMode())
+		{
+			const auto bit = 45 + g_aluBitOffset + (mode->testSR(SRB_S1) ? 1 : 0) -
+				(mode->testSR(SRB_S0) ? 1 : 0);
+			m_asm.shr(r64(result), asmjit::Imm(bit));
+		}
+		else
+		{
+			const DSPRegTemp bit(m_block, true);
+			sr_getBitValue(r64(bit), SRB_S1);
+			m_asm.add(r64(bit), asmjit::Imm(45 + g_aluBitOffset));
+			sr_getBitValue(r64(adjacent), SRB_S0);
+			m_asm.sub(r64(bit), r64(adjacent));
+#ifdef HAVE_ARM64
+			m_asm.lsr(r64(result), r64(result), r64(bit));
+#else
+			m_asm.bt(r64(result), r64(bit));
+			m_asm.setc(r64(result).r8());
+#endif
+		}
+		m_asm.and_(r32(result), asmjit::Imm(1));
+		m_asm.shl(r32(result), asmjit::Imm(CCRB_S));
+		m_asm.or_(r32(m_dspRegs.getSR(JitDspRegs::ReadWrite)), r32(result));
+		ccr_clearDirty(CCR_S);
+	}
+
+	void JitOps::updateTransferScalingFlag()
+	{
+		// FM table 5-1 observes BOTH accumulators before the bus transfer.
+		// The register pool retains their pre-ALU values for parallel moves.
+		const auto a = m_dspRegs.getALU(0);
+		const auto b = m_dspRegs.getALU(1);
+		ccr_s_update(r64(a));
+		ccr_s_update(r64(b));
+		m_ccrWritten |= CCR_S;
+	}
+
 	void JitOps::transferAluTo24(DspValue& _dst, const TWord _alu)
 	{
+		updateTransferScalingFlag();
 		if (!_dst.isRegValid())
 			_dst.temp(DspValue::Temp24);
 		if(isSixteenBitArithmetic())
 			transferSaturation16(r64(_dst.get()), r64(m_dspRegs.getALU(_alu)));
 		else
 			transferSaturation24(r64(_dst.get()), r64(m_dspRegs.getALU(_alu)));
+	}
+
+	bool JitOps::isArithmeticSaturation() const
+	{
+		const auto* mode = m_block.getMode();
+		return mode && mode->testSR(SRB_SM);
+	}
+
+	bool JitOps::arithmeticSaturation(const JitReg64& _value, bool _rounded)
+	{
+		if(!isArithmeticSaturation()) return false;
+		// Compare the two low detection bits with EXT[7]. Unlike transfer
+		// limiting this is the exact three-bit table, not a range comparison.
+		uint64_t positive = isSixteenBitArithmetic() ? 0x007fff00ffff00ull : 0x007fffffffffffull;
+		if(_rounded) positive &= ~0xffffffull;
+		positive <<= g_aluBitOffset;
+		const uint64_t negative = 0xff800000000000ull << g_aluBitOffset;
+		const DSPRegTemp sign(m_block, true), limit(m_block, true), test(m_block, true);
+		m_asm.mov(r64(sign), _value);
+		aluExtendTo64(sign.get());
+		m_asm.sar(r64(sign), asmjit::Imm(63));
+		m_asm.mov(r64(limit), asmjit::Imm(positive ^ negative));
+		m_asm.and_(r64(limit), r64(sign));
+		m_asm.mov(r64(test), asmjit::Imm(positive));
+		m_asm.xor_(r64(limit), r64(test));
+		m_asm.mov(r64(test), _value);
+		m_asm.shr(r64(test), asmjit::Imm(47 + g_aluBitOffset));
+		m_asm.xor_(r64(test), r64(sign));
+		m_asm.and_(r32(test), asmjit::Imm(3));
+		m_asm.test_(r32(test));
+#ifdef HAVE_ARM64
+		m_asm.csel(_value, r64(limit), _value, asmjit::arm::CondCode::kNE);
+#else
+		m_asm.cmovnz(_value, r64(limit));
+#endif
+		if(!m_disableCCRUpdates)
+		{
+#ifdef HAVE_ARM64
+			ccr_vl_update_ifNotZero();
+#else
+			ccr_vl_update(asmjit::x86::CondCode::kNE);
+#endif
+			m_ccrWritten |= CCR_V | CCR_L;
+			ccr_clearDirty(static_cast<CCRMask>(CCR_V | CCR_L));
+		}
+		return true;
 	}
 
 	bool JitOps::isSixteenBitArithmetic() const
@@ -533,7 +628,33 @@ namespace dsp56k
 		m_asm.and_(r32(_value), asmjit::Imm(0xffff));
 	}
 
-	// X:Y -> full accumulator in 16-bit mode: X[15..0] -> bits 47..32, Y[15..0] -> bits 31..16, EXT sign extended
+	void JitOps::packArithmeticSA(const JitReg64& _value) const
+	{
+		if(!isSixteenBitArithmetic()) return;
+		const RegScratch low(m_block);
+		m_asm.mov(r64(low), _value);
+		m_asm.shr(r64(low), asmjit::Imm(8 + g_aluBitOffset));
+		m_asm.and_(r32(low), asmjit::Imm(0xffff));
+		m_asm.shl(r64(low), asmjit::Imm(16 + g_aluBitOffset));
+		m_asm.shr(_value, asmjit::Imm(32 + g_aluBitOffset));
+		m_asm.shl(_value, asmjit::Imm(32 + g_aluBitOffset));
+		m_asm.or_(_value, r64(low));
+	}
+
+	void JitOps::unpackArithmeticSA(const JitReg64& _value) const
+	{
+		if(!isSixteenBitArithmetic()) return;
+		const RegScratch low(m_block);
+		m_asm.mov(r64(low), _value);
+		m_asm.shr(r64(low), asmjit::Imm(16 + g_aluBitOffset));
+		m_asm.and_(r32(low), asmjit::Imm(0xffff));
+		m_asm.shl(r64(low), asmjit::Imm(8 + g_aluBitOffset));
+		m_asm.shr(_value, asmjit::Imm(32 + g_aluBitOffset));
+		m_asm.shl(_value, asmjit::Imm(32 + g_aluBitOffset));
+		m_asm.or_(_value, r64(low));
+	}
+
+	// X:Y -> full accumulator in 16-bit mode: X[15..0] -> bits 47..32, Y[15..0] -> bits 23..8, EXT sign extended
 	void JitOps::sixteenBitLongToAlu(const TWord _alu, const DspValue& _x, const DspValue& _y)
 	{
 		AluRef r(m_block, _alu, false, true);
@@ -546,7 +667,7 @@ namespace dsp56k
 
 		m_asm.mov(r32(t), r32(_y.get()));
 		m_asm.and_(r32(t), asmjit::Imm(0xffff));
-		m_asm.shl(r64(t), asmjit::Imm(16 + g_aluBitOffset));
+		m_asm.shl(r64(t), asmjit::Imm(8 + g_aluBitOffset));
 		m_asm.or_(r64(r), r64(t));
 
 		if constexpr (!g_leftAlignedAlu)
@@ -562,7 +683,9 @@ namespace dsp56k
 		if(!_y.isRegValid())
 			_y.temp(DspValue::Temp24);
 
-		transferSaturation48(r64(_y.get()), r64(m_dspRegs.getALU(_alu)));
+		m_asm.mov(r64(_y.get()), r64(m_dspRegs.getALU(_alu)));
+		packArithmeticSA(r64(_y.get()));
+		transferSaturation48(r64(_y.get()), r64(_y.get()));
 
 		m_asm.mov(r64(_x.get()), r64(_y.get()));
 		m_asm.shr(r64(_x.get()), asmjit::Imm(32));

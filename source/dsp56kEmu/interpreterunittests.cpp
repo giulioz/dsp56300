@@ -8,21 +8,19 @@ namespace dsp56k
 {
 	InterpreterUnitTests::InterpreterUnitTests()
 	{
+		if constexpr(g_useJIT)
+			verify(dsp.m_opcodeCycleCache.empty());
+		dsp.setUseJit(false);
 		testCCCC();
 		testSubr();
 		testCycleAccounting();
+		testLoopYielding();
 		
 		runAllTests();
 	}
 
 	void InterpreterUnitTests::testCycleAccounting()
 	{
-		if constexpr(g_useJIT)
-		{
-			// Normal JIT builds must not pay for the interpreter-only per-PC cache.
-			verify(dsp.m_opcodeCycleCache.empty());
-			return;
-		}
 
 		verify(dsp.m_opcodeCycleCache.size() == dsp.memory().sizeP());
 
@@ -61,6 +59,52 @@ namespace dsp56k
 		dsp.setPC(0x100);
 		dsp.execInterpreter();
 		verify(dsp.getCycles() == 15); // DO (5) + five two-NOP iterations
+	}
+
+	void InterpreterUnitTests::testLoopYielding()
+	{
+		dsp.resetHW();
+		dsp.setYieldInterpreterLoops(true);
+		TWord pc = 0x100;
+		pc = emitToMemory("do #$3,>$105", pc);
+		pc = emitToMemory("do #$2,>$105", pc);
+		emitToMemory("nop", pc);
+		dsp.setPC(0x100);
+		dsp.execInterpreter();
+		verify(dsp.getPC().var == 0x102);
+		verify(dsp.getCycles() == 5);
+		// Nested loops share an end address. Retiring the inner loop must also
+		// retire the outer iteration when its last instruction has completed.
+		unsigned steps = 0;
+		while(dsp.getPC().var != 0x105 && steps++ < 32) dsp.execInterpreter();
+		verify(dsp.getPC().var == 0x105);
+		verify(dsp.getCycles() == 26); // outer DO + 3 * (inner DO + 2 NOPs)
+		verify(!dsp.sr_test_noCache(SR_LF));
+		verify(dsp.regs().sc.var == 0);
+
+		dsp.resetHW();
+		pc = emitToMemory("do #$2,>$104", 0x100);
+		pc = emitToMemory("nop", pc);
+		emitToMemory("nop", pc);
+		dsp.memWriteP(0x40, 0x0d0300); // JSR $300: long interrupt
+		dsp.memWriteP(0x41, 0);
+		dsp.memWriteP(0x300, 0);
+		dsp.memWriteP(0x301, 4); // RTI
+		dsp.sr_clear(static_cast<CCRMask>(SR_I0 | SR_I1));
+		dsp.setPC(0x100);
+		dsp.execInterpreter();
+		dsp.injectInterrupt(0x40);
+		dsp.execInterpreter();
+		verify(dsp.getPC().var == 0x301);
+		verify(!dsp.sr_test_noCache(SR_LF));
+		dsp.execInterpreter();
+		verify(dsp.getPC().var == 0x102);
+		verify(dsp.sr_test_noCache(SR_LF));
+		verify(dsp.regs().lc.var == 2);
+		for(unsigned i = 0; i < 4; ++i) dsp.execInterpreter();
+		verify(dsp.getPC().var == 0x104);
+		verify(dsp.regs().sc.var == 0);
+		dsp.setYieldInterpreterLoops(false);
 	}
 
 	void InterpreterUnitTests::execOpcode(uint32_t _op0, uint32_t _op1, const bool _reset, TWord _pc)

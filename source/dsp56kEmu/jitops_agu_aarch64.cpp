@@ -141,8 +141,14 @@ namespace dsp56k
 		m_dspRegs.maskSC1624(_r);
 	}
 
-	void JitOps::updateAddressRegisterSubModuloN1(const JitReg32& _r, const JitReg32& _m, const JitReg32& _mMask, bool _addN) const
+	void JitOps::updateAddressRegisterSubModuloN1(const JitReg32& _r, const JitReg32& _mRaw, const JitReg32& _mMask, bool _addN) const
 	{
+		// Mn[23:16] is readable but ignored by address arithmetic (FM table 4-2).
+		const DSPRegTemp modifier(m_block, true);
+		m_asm.mov(r32(modifier), _mRaw);
+		m_asm.and_(r32(modifier), asmjit::Imm(0xffff));
+		const auto _m = r32(modifier);
+
 		const RegScratch scratch(m_block);
 		const auto p = r32(scratch);
 
@@ -161,8 +167,14 @@ namespace dsp56k
 		}
 	}
 
-	void JitOps::updateAddressRegisterSubModulo(const JitReg32& r, const JitReg32& n, const JitReg32& m, const JitReg32& mMask, bool _addN) const
+	void JitOps::updateAddressRegisterSubModulo(const JitReg32& r, const JitReg32& n, const JitReg32& mRaw, const JitReg32& mMask, bool _addN) const
 	{
+		// Mn[23:16] is readable but ignored by address arithmetic (FM table 4-2).
+		const DSPRegTemp modifier(m_block, true);
+		m_asm.mov(r32(modifier), mRaw);
+		m_asm.and_(r32(modifier), asmjit::Imm(0xffff));
+		const auto m = r32(modifier);
+
 		const ShiftReg shift(m_block);
 		const RegScratch scratch(m_block);
 

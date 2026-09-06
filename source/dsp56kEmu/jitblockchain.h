@@ -86,6 +86,8 @@ namespace dsp56k
 
 	private:
 
+		JitBlockRuntimeData* getRepeatedBodyBlock(TWord _pc) const;
+
 		void destroyParents(JitBlockRuntimeData* _block);
 		void destroy(JitBlockRuntimeData* _block);
 

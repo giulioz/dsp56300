@@ -71,6 +71,30 @@ namespace dsp56k
 		ccr_update(_bit, asmjit::arm::CondCode::kLE);
 	}
 
+	void JitOps::ccr_updateArithmeticFlags(bool _subtract)
+	{
+		// C was cleared before ADDS/SUBS; V may retain preceding shift overflow.
+		// CSET/ORR preserve NZCV,
+		// so both conditions can be consumed without saving host flags.
+		assert(!m_ccr_update_clear);
+		const auto sr = r32(m_dspRegs.getSR(JitDspRegs::ReadWrite));
+		const RegScratch flag(m_block);
+		m_asm.cset(r32(flag), _subtract ? asmjit::arm::CondCode::kCC : asmjit::arm::CondCode::kCS);
+		m_asm.orr(sr, sr, r32(flag));
+		if(isArithmeticSaturation())
+		{
+			// SM derives V/L from the saturation table after the full operation.
+			ccr_clearDirty(CCR_C);
+			m_ccrWritten |= CCR_C;
+			return;
+		}
+		m_asm.cset(r32(flag), asmjit::arm::CondCode::kVS);
+		m_asm.orr(sr, sr, r32(flag), asmjit::arm::lsl(CCRB_V));
+		m_asm.orr(sr, sr, r32(flag), asmjit::arm::lsl(CCRB_L));
+		ccr_clearDirty(static_cast<CCRMask>(CCR_C | CCR_V | CCR_L));
+		m_ccrWritten |= CCR_C | CCR_V | CCR_L;
+	}
+
 	void JitOps::ccr_update_ifCarry(CCRBit _bit)
 	{
 		ccr_update(_bit, asmjit::arm::CondCode::kCS);
@@ -263,44 +287,6 @@ namespace dsp56k
 		copyBitToCCR(_alu, 23 + g_aluBitOffset, CCRB_N);
 	}
 
-	void JitOps::ccr_s_update(const JitReg64& _alu)
-	{
-		const auto exit = m_asm.newLabel();
-
-		m_asm.tbnz(m_dspRegs.getSR(JitDspRegs::Read), asmjit::Imm(CCRB_S), exit);
-
-		const auto* mode = m_block.getMode();
-
-		if(mode)
-		{
-			const auto bit = 45 + g_aluBitOffset + (mode->testSR(SRB_S1) ? 1 : 0) - (mode->testSR(SRB_S0) ? 1 : 0);
-
-			const RegGP alu(m_block);
-			m_asm.lsr(alu, _alu, asmjit::Imm(bit));
-			m_asm.eor(alu, alu, alu, asmjit::arm::lsr(1));
-			copyBitToCCR(alu, 0, CCRB_S);
-		}
-		else
-		{
-			const RegGP bit(m_block);
-
-			{
-				const RegGP s0s1(m_block);
-				sr_getBitValue(s0s1, SRB_S1);
-				m_asm.add(bit, s0s1.get(), asmjit::Imm(45 + g_aluBitOffset));
-
-				sr_getBitValue(s0s1, SRB_S0);
-				m_asm.sub(bit, s0s1.get());
-			}
-
-			const RegGP alu(m_block);
-			m_asm.lsr(alu, _alu, bit.get());
-			m_asm.eor(alu, alu, alu, asmjit::arm::lsr(1));
-			copyBitToCCR(alu, 0, CCRB_S);
-		}
-
-		m_asm.bind(exit);
-	}
 
 	void JitOps::ccr_vl_update_ifNotZero()
 	{

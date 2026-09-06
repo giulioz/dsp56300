@@ -485,6 +485,8 @@ namespace dsp56k
 		void busToReg16InPlace(DspValue& _value) const;
 		const DspValue& busToRegSA(const DspValue& _src, DspValue& _temp) const;
 		void reg16ToBus(DspValue& _value) const;
+		void packArithmeticSA(const JitReg64& _value) const;
+		void unpackArithmeticSA(const JitReg64& _value) const;
 		void sixteenBitLongToAlu(TWord _alu, const DspValue& _x, const DspValue& _y);
 		void aluToSixteenBitLong(TWord _alu, DspValue& _x, DspValue& _y);
 
@@ -507,6 +509,7 @@ namespace dsp56k
 		void ccr_update_ifLess(CCRBit _bit);
 		void ccr_update_ifLessEqual(CCRBit _bit);
 		void ccr_update_ifCarry(CCRBit _bit);
+		void ccr_updateArithmeticFlags(bool _subtract);
 		void ccr_update_ifNotCarry(CCRBit _bit);
 #ifndef HAVE_ARM64
 		void ccr_update_ifParity(CCRBit _bit);
@@ -529,6 +532,7 @@ namespace dsp56k
 		void ccr_n_update_by47(const JitReg64& _alu);
 		void ccr_n_update_by23(const JitReg64& _alu);
 		void ccr_s_update(const JitReg64& _alu);
+		void updateTransferScalingFlag();
 		void ccr_l_update_by_v();
 
 		// V is overwritten while L is a sticky OR of V, so where both are written together they can be
@@ -600,7 +604,11 @@ namespace dsp56k
 		void unsignedImmediateToAlu(const JitReg64& _r, const uint8_t _i) const;
 
 		void alu_abs(const JitRegGP& _r);
+		void alu_unary(TWord _ab, bool _absolute);
 		
+		bool arithmeticSaturation(const JitReg64& _value, bool _rounded = false);
+		bool isArithmeticSaturation() const;
+		void alu_shiftedArithmetic(TWord _ab, bool _left, bool _subtract);
 		void alu_add(TWord _ab, const JitReg64& _v);
 		void alu_add(TWord _ab, uint8_t _v);
 
@@ -617,6 +625,7 @@ namespace dsp56k
 		void alu_bchg(const DspValue& _dst, TWord _bit);
 
 		void alu_cmp(TWord ab, const JitReg64& _v, bool magnitude);
+		void alu_rotate(TWord _ab, bool _right);
 
 		void alu_lsl(TWord ab, const DspValue& _shiftAmount);
 		void alu_lsr(TWord ab, const DspValue& _shiftAmount);

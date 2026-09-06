@@ -46,7 +46,7 @@ namespace dsp56k
 				n = signextend<int, 24>(n);
 
 				const auto lowerBound = r & ~moduloMask;
-				const auto upperBound = lowerBound + m;
+				const auto upperBound = lowerBound + (m & 0xffff);
 
 				if constexpr(add)
 					r += n;
@@ -55,9 +55,12 @@ namespace dsp56k
 
 				modulo = n & moduloMask ? modulo : 0;
 
-				if(r < lowerBound)
+				// A legal negative offset can temporarily put the address below
+				// zero. Compare the 32-bit intermediate as signed before the final
+				// 24-bit mask, just as the native JIT paths do (FM 4.5.3).
+				if(static_cast<int32_t>(r) < static_cast<int32_t>(lowerBound))
 					r += modulo;
-				if(r > upperBound)
+				if(static_cast<int32_t>(r) > static_cast<int32_t>(upperBound))
 					r -= modulo;
 				/*
 				if constexpr(add)

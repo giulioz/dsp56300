@@ -645,6 +645,7 @@ namespace dsp56k
 
 	inline void DSP::decode_LLL_read(TWord _lll, TWord& x, TWord& y)
 	{
+		if(_lll >= 4) sr_s_update();
 		switch (_lll)
 		{
 		case 0: convert(x, regToBus(a1()));	convert(y, regToBus(a0()));	return;

@@ -282,6 +282,8 @@ namespace dsp56k
 		if(_dst != _src)
 			m_asm.mov(r64(_dst), r64(_src));
 
+		packArithmeticSA(_dst);
+
 		if(mode)
 		{
 			int shift = 32 + g_aluBitOffset;
@@ -330,63 +332,28 @@ namespace dsp56k
 
 	void JitOps::transferSaturation48(const JitReg64& _dst, const JitReg64& _src)
 	{
-		// scaling
-
-		/*
-		if( sr_test_noCache(SR_S1) )
-			_scale.var <<= 1;
-		else if( sr_test_noCache(SR_S0) )
-			_scale.var >>= 1;
-		*/
+		// Leave headroom for scaling before limiting. Scaling the left-aligned
+		// value first loses its sign on overflow (FM 3.1.6.2).
+		if(_dst != _src) m_asm.mov(_dst, _src);
+		if constexpr (g_leftAlignedAlu) m_asm.sar(_dst, asmjit::Imm(8));
+		else signextend56to64(_dst);
 
 		const auto* mode = m_block.getMode();
-
 		if(mode)
 		{
-			int shift = 0;
-			if(mode->testSR(SRB_S1))
-				++shift;
-			if(mode->testSR(SRB_S0))
-				--shift;
-
-			if(shift > 0)
-			{
-				if(_dst != _src)
-					m_asm.lea(_dst, ptr(_src, _src));
-				else
-					m_asm.add(_dst, _src);
-			}
-			else
-			{
-				if(_dst != _src)
-					m_asm.mov(r64(_dst), r64(_src));
-
-				if(shift < 0)
-					m_asm.sar(_dst, asmjit::Imm(1));
-			}
+			if(mode->testSR(SRB_S1)) m_asm.shl(_dst, asmjit::Imm(1));
+			else if(mode->testSR(SRB_S0)) m_asm.sar(_dst, asmjit::Imm(1));
 		}
 		else
 		{
-			if(_dst != _src)
-				m_asm.mov(r64(_dst), r64(_src));
-
 			const ShiftReg s0s1(m_block);
-
 			sr_getBitValue(s0s1, SRB_S1);
 			m_asm.shl(_dst, s0s1.get().r8());
-
 			sr_getBitValue(s0s1, SRB_S0);
 			m_asm.sar(_dst, s0s1.get().r8());
 		}
 
 		{
-			// left-aligned: an arithmetic shift down by 8 yields exactly the sign-extended 56-bit value that
-			// signextend56to64() produces for the right-aligned form, so the limiting below is unchanged
-			if constexpr (g_leftAlignedAlu)
-				m_asm.sar(_dst, asmjit::Imm(8));
-			else
-				signextend56to64(_dst);
-
 			const RegGP tester(m_block);
 			m_asm.mov(r64(tester), r64(_dst));
 

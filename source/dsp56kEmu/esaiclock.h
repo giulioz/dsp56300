@@ -77,10 +77,16 @@ namespace dsp56k
 		void setClockSource(const DSP* _dsp, ClockSource _clockSource);
 
 		void updateCyclesPerSample();
+		void advancePeriod();
 
 		const uint64_t* m_dspInstructionCounter = nullptr;
 		uint64_t m_lastClock = 0;
 		uint32_t m_cyclesPerSample = 2133;				// estimated cycles per sample before calculated
+
+		uint32_t m_periodWhole = 2133;
+		uint64_t m_periodRemainder = 0;
+		uint64_t m_periodDenominator = 1;
+		uint64_t m_periodPhase = 0;
 
 		ClockSource m_clockSource = ClockSource::Instructions;
 

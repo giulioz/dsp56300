@@ -99,18 +99,19 @@ namespace dsp56k
 		auto writesM = RegisterMask::None;
 		auto readsM = RegisterMask::None;
 
-		while(shouldEmit)
+		bool repeatBody = false;
+		while(shouldEmit || repeatBody)
 		{
 			const auto pc = _pc + numWords;
 
-			if(pc >= pcMax)
+			if(!repeatBody && pc >= pcMax)
 			{
 				terminationReason = JitBlockInfo::TerminationReason::PcMax;
 				break;
 			}
 
 			// never overwrite code that already exists
-			if(pc < _cache.size() && _cache[pc].block)
+			if(!repeatBody && pc < _cache.size() && _cache[pc].block)
 			{
 				terminationReason = JitBlockInfo::TerminationReason::ExistingCode;
 				break;
@@ -133,6 +134,30 @@ namespace dsp56k
 			const auto readM = read & RegisterMask::M;
 
 			const auto flags = Opcodes::getFlags(instA, instB);
+			const auto isRep = flags & (OpFlagRepDynamic | OpFlagRepImmediate);
+			// Do not admit REP without owning its body as well. Start a new block
+			// here so the chain can retire the cached body before compiling the pair.
+			if(isRep && pc + 1 < _cache.size() && _cache[pc + 1].block)
+			{
+				assert(numInstructions != 0);
+				terminationReason = JitBlockInfo::TerminationReason::ExistingCode;
+				break;
+			}
+
+			if(isRep && writesM != RegisterMask::None)
+			{
+				Instruction bodyA, bodyB;
+				opcodes.getInstructionTypes(opB, bodyA, bodyB);
+				auto bodyWritten = RegisterMask::None, bodyRead = RegisterMask::None;
+				Opcodes::getRegisters(bodyWritten, bodyRead, opB, bodyA, bodyB);
+				if((bodyRead & writesM) != RegisterMask::None)
+				{
+					// Let the changed addressing mode take effect before the pair,
+					// rather than discovering this barrier between REP and its body.
+					terminationReason = JitBlockInfo::TerminationReason::ModeChange;
+					break;
+				}
+			}
 
 			// a jsr in a fast interrupt modifies the MR because it disables scaling mode bits, loop flag and sixteen-bit arithmetic mode
 			if(isFastInterrupt && (written & RegisterMask::SSL) != RegisterMask::None)
@@ -159,7 +184,7 @@ namespace dsp56k
 			// while an M register change causes a mode change, we can continue this block as long as that M register is not read in a subsequent instruction
 			if((writesM & readsM) != RegisterMask::None)
 			{
-				if(numInstructions)
+				if(numInstructions && !repeatBody)
 				{
 					_info.terminationReason = JitBlockInfo::TerminationReason::ModeChange;
 					break;
@@ -171,12 +196,10 @@ namespace dsp56k
 				(_volatileP.find(pc+1) != _volatileP.end() && Opcodes::getOpcodeLength(opA, instA, instB) == 2))
 			{
 				terminationReason = JitBlockInfo::TerminationReason::VolatileP;
-				if (numInstructions)
+				if (numInstructions && !repeatBody)
 					break;
 				shouldEmit = false;
 			}
-
-			const auto isRep = flags & (OpFlagRepDynamic | OpFlagRepImmediate);
 
 			writtenRegs |= written;
 			readRegs |= read;
@@ -193,6 +216,10 @@ namespace dsp56k
 			numWords += Opcodes::getOpcodeLength(opA, instA, instB);
 			++numInstructions;
 			numCycles += calcCycles(instA, instB, pc, opA, _dsp.memory().getBridgedMemoryAddress(), 1);
+
+			repeatBody = isRep != 0;
+			if(repeatBody)
+				continue;
 
 			if(getLoopEndAddr(_info.loopEnd, instA, pc, opB))
 				_info.loopBegin = pc;
@@ -469,6 +496,7 @@ namespace dsp56k
 			ccrOverwrite |= ccrO;
 		}
 
+		assert(pMemSize == info.memSize);
 		assert(_rt.getEncodedCycleCount() >= _rt.getEncodedInstructionCount());
 
 		if (info.terminationReason == JitBlockInfo::TerminationReason::PopPC)

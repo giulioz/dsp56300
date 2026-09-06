@@ -16,7 +16,7 @@ namespace dsp56k
 	{
 		TReg56& d = ab ? reg.b : reg.a;
 
-		d.var &= (TInt64(_val)<<(24 + g_aluShift)) | static_cast<TInt64>(0xFF000000FFFFFF00ull);
+		d.var &= (TInt64(isSixteenBitArithmetic() ? _val & 0xffff00 : _val)<<(24 + g_aluShift)) | static_cast<TInt64>(0xFF000000FFFFFF00ull);
 
 		// S L E U N Z V C
 		// v - - - * * * -
@@ -34,6 +34,7 @@ namespace dsp56k
 		TReg56& d = ab ? reg.b : reg.a;
 
 		d.var |= (TInt64(_val)<<(24 + g_aluShift));
+		if(isSixteenBitArithmetic()) d.var &= ~(uint64_t(0xff) << (24 + g_aluShift));
 
 		// S L E U N Z V C
 		// v - - - * * * -
@@ -50,6 +51,7 @@ namespace dsp56k
 		TReg56& d = ab ? reg.b : reg.a;
 
 		d.var ^= (TInt64(_val)<<(24 + g_aluShift));
+		if(isSixteenBitArithmetic()) d.var &= ~(uint64_t(0xff) << (24 + g_aluShift));
 
 		// S L E U N Z V C
 		// v - - - * * * -
@@ -65,22 +67,22 @@ namespace dsp56k
 	{
 		TReg56& d = ab ? reg.b : reg.a;
 
-		const TReg56 old = d;
+		const uint64_t d64 = arithmeticValue(d);
+		const uint64_t value = arithmeticValue(_val);
+		const uint64_t res = d64 + value;
+		const bool overflow = (~(d64 ^ value) & (d64 ^ res)) >> 63;
 
-		const uint64_t d64 = d.var;
-		const uint64_t res = d64 + _val.var;
-
-		d.var = res;
-		aluMask(d);
+		arithmeticResult(d, res);
 
 		const auto carry = int(res < d64);	// carry out of the accumulator = 64-bit unsigned overflow
 
 		// S L E U N Z V C
 
-		sr_z_update(d);
 		sr_toggle(CCRB_C, Bit(carry));
-		sr_clear(CCR_V);						// I did not manage to make the ALU overflow in the simulator, apparently that SR bit is only used for other ops
-//		sr_l_update_by_v();
+		sr_toggle(CCR_V, overflow);
+		limit_arithmeticSaturation(d);
+		sr_z_update(d);
+		sr_l_update_by_v();
 
 //		sr_s_update();
 //		sr_e_update(d);
@@ -101,31 +103,31 @@ namespace dsp56k
 
 		const TReg56 oldD = d;
 
-		uint64_t d64 = d.var;
+		uint64_t d64 = arithmeticValue(d);
 
-		uint64_t val = _val.var;
+		uint64_t val = arithmeticValue(_val);
 
 		if( _magnitude )
 		{
-			const auto d64Signed = aluSignextend(d);
+			const auto d64Signed = static_cast<int64_t>(arithmeticValue(d));
 			if(d64Signed < 0)
-				d64 = -d64Signed;
+				d64 = uint64_t(0) - d64;
 
-			const auto valSigned = aluSignextend(_val);
+			const auto valSigned = static_cast<int64_t>(arithmeticValue(_val));
 			if(valSigned < 0)
-				val = -valSigned;
+				val = uint64_t(0) - val;
 		}
 
 		const auto res = static_cast<uint64_t>(d64) - static_cast<uint64_t>(val);
 
 		const auto carry = val > d64;	// borrow out of the accumulator
 
-		d.var = res;
-		aluMask(d);
+		arithmeticResult(d, res);
 
+		sr_toggle(CCR_V, ((d64 ^ val) & (d64 ^ res)) >> 63);
+		limit_arithmeticSaturation(d);
 		sr_z_update(d);
-		sr_clear(CCR_V);		// as cmp is identical to sub, the same for the V bit applies (see sub for details)
-		//sr_l_update_by_v();
+		sr_l_update_by_v();
 		sr_toggle(CCR_C, carry);
 
 		setCCRDirty(ab, d, CCR_E | CCR_U | CCR_N);
@@ -139,11 +141,7 @@ namespace dsp56k
 	{
 		// CMPU compares two 48 bit UNSIGNED operands. The accumulator extension takes no part in the
 		// operation, and a 24 bit source has already been left-aligned and zero-filled by the decoder.
-		// E and U are unchanged by the instruction. Unlike the JIT, which can leave them lazy because it
-		// clears the dirty flags of the bits it writes, updateDirtyCCR() here recomputes E, U AND N in
-		// one go regardless of which of them are actually dirty - so anything left pending would clobber
-		// the N written below. Resolve it now, from the previous instruction's result.
-		updateDirtyCCR();
+		// E and U are unchanged; writing N below cancels only its pending cache entry.
 
 		const TReg56& d = ab ? reg.b : reg.a;
 
@@ -167,20 +165,21 @@ namespace dsp56k
 	{
 		TReg56& d = ab ? reg.b : reg.a;
 
-		const uint64_t d64 = d.var;
-		const uint64_t res = d64 - static_cast<uint64_t>(_val.var);
+		const uint64_t d64 = arithmeticValue(d);
+		const uint64_t value = arithmeticValue(_val);
+		const uint64_t res = d64 - value;
 
-		const auto carry = static_cast<uint64_t>(_val.var) > d64;	// borrow out of the accumulator
+		const auto carry = value > d64;	// borrow out of the accumulator
 
-		d.var = res;
-		aluMask(d);
+		arithmeticResult(d, res);
 
 		// S L E U N Z V C
 		sr_toggle(CCR_C, carry);
-		sr_clear(CCR_V);						// I did not manage to make the ALU overflow in the simulator, apparently that SR bit is only used for other ops
+		sr_toggle(CCR_V, ((d64 ^ value) & (d64 ^ res)) >> 63);
 
+		limit_arithmeticSaturation(d);
 		sr_z_update(d);
-		//sr_l_update_by_v();
+		sr_l_update_by_v();
 		setCCRDirty(ab, d, CCR_E | CCR_U | CCR_N);
 	}
 
@@ -191,16 +190,17 @@ namespace dsp56k
 	{
 		const TReg56& dSrc = abSrc ? reg.b : reg.a;
 
-		const TInt64 d64 = aluSignextend(dSrc);
+		const TInt64 d64 = static_cast<int64_t>(arithmeticValue(dSrc));
 
-		sr_toggle( CCR_C, _shiftAmount && bittest(d64, _shiftAmount - 1 + g_aluShift) );
+		const bool carry = isSixteenBitArithmetic() && _shiftAmount >= 40
+			? d64 < 0 : _shiftAmount && bittest(d64, _shiftAmount - 1 + (isSixteenBitArithmetic() ? 24 : g_aluShift));
+		sr_toggle(CCR_C, carry);
 
 		const TInt64 res = d64 >> _shiftAmount;
 
 		TReg56& d = abDst ? reg.b : reg.a;
 
-		d.var = res;
-		aluMask(d);	// discards the bits shifted below the accumulator
+		arithmeticResult(d, res);	// discards the bits shifted below the accumulator
 
 		// S L E U N Z V C
 
@@ -217,7 +217,7 @@ namespace dsp56k
 	{
 		const TReg56& dSrc = abSrc ? reg.b : reg.a;
 
-		const TInt64 d64 = aluSignextend(dSrc);
+		const TInt64 d64 = static_cast<int64_t>(arithmeticValue(dSrc));
 
 		sr_toggle( CCR_C, _shiftAmount && ((d64 & (TInt64(1)<<(56 + g_aluShift - _shiftAmount))) != 0) );
 
@@ -225,8 +225,7 @@ namespace dsp56k
 
 		TReg56& d = abDst ? reg.b : reg.a;
 
-		d.var = res;
-		aluMask(d);
+		arithmeticResult(d, res);
 
 		// Overflow: Set if Bit 55 is changed any time during the shift operation, cleared otherwise.
 		// What that means for us is that all bits that are shifted out need to be identical to not overflow
@@ -248,110 +247,75 @@ namespace dsp56k
 	// _____________________________________________________________________________
 	// alu_lsl
 	//
-	void DSP::alu_lsl( bool ab, int _shiftAmount )
+	void DSP::alu_lsl(bool ab, int _shiftAmount)
 	{
-		TReg24 d = ab ? b1() : a1();
-
-		sr_toggle( CCR_C, _shiftAmount && bittest( d, 23-_shiftAmount+1) );
-
-		const int res = (d.var << _shiftAmount) & 0x00ffffff;
-
-		if( ab )
-			b1(TReg24(res));
-		else
-			a1(TReg24(res));
-
-		// S L E U N Z V C
-
-		sr_toggle( CCR_N, bittest(res,23) );
-		sr_toggle( CCR_Z, res == 0 );
-		sr_clear( CCR_V );
-
-		//sr_l_update_by_v();
+		const unsigned pad = isSixteenBitArithmetic() ? 8 : 0, width = 24 - pad;
+		const uint32_t value = (ab ? b1() : a1()).toWord() >> pad;
+		const uint32_t mask = (1u << width) - 1;
+		const bool carry = _shiftAmount > 0 && unsigned(_shiftAmount) <= width && ((value >> (width - _shiftAmount)) & 1);
+		const auto result = _shiftAmount >= int(width) ? 0 : (value << _shiftAmount) & mask;
+		if(ab) b1(TReg24(result << pad)); else a1(TReg24(result << pad));
+		sr_toggle(CCR_C, carry);
+		sr_toggle(CCR_N, (result & (1u << (width - 1))) != 0);
+		sr_toggle(CCR_Z, result == 0);
+		sr_clear(CCR_V);
 	}
 
-	// _____________________________________________________________________________
-	// alu_lsr
-	//
-	void DSP::alu_lsr( bool ab, int _shiftAmount )
+	void DSP::alu_lsr(bool ab, int _shiftAmount)
 	{
-		TReg24 d = ab ? b1() : a1();
+		const unsigned pad = isSixteenBitArithmetic() ? 8 : 0, width = 24 - pad;
+		const uint32_t value = (ab ? b1() : a1()).toWord() >> pad;
+		const bool carry = _shiftAmount > 0 && unsigned(_shiftAmount) <= width && ((value >> (_shiftAmount - 1)) & 1);
+		const auto result = _shiftAmount >= int(width) ? 0 : value >> _shiftAmount;
+		if(ab) b1(TReg24(result << pad)); else a1(TReg24(result << pad));
+		sr_toggle(CCR_C, carry);
+		sr_toggle(CCR_N, (result & (1u << (width - 1))) != 0);
+		sr_toggle(CCR_Z, result == 0);
+		sr_clear(CCR_V);
+	}
 
-		sr_toggle( CCR_C, _shiftAmount && bittest( d, _shiftAmount-1) );
-
-		const unsigned int res = ((unsigned int)d.var >> _shiftAmount);
-
-		if( ab )
-			b1(TReg24(res));
-		else
-			a1(TReg24(res));
-
-		// S L E U N Z V C
-
-		sr_toggle( CCR_N, bittest(res,23) );
-		sr_toggle( CCR_Z, res == 0 );
-		sr_clear( CCR_V );
+	void DSP::alu_shiftedArithmetic(bool ab, bool _left, bool _subtract)
+	{
+		TReg56& d = ab ? reg.b : reg.a;
+		const uint64_t original = arithmeticValue(d);
+		const uint64_t source = arithmeticValue(ab ? reg.a : reg.b);
+		const uint64_t shifted = _left ? original << 1 :
+			(static_cast<uint64_t>(static_cast<int64_t>(original) >> 1) &
+				(~uint64_t(0) << (isSixteenBitArithmetic() ? 24 : g_aluShift)));
+		const uint64_t result = _subtract ? shifted - source : shifted + source;
+		const bool shiftOverflow = _left && ((original ^ shifted) >> 63);
+		const bool overflow = shiftOverflow ||
+			(((_subtract ? shifted ^ source : ~(shifted ^ source)) & (shifted ^ result)) >> 63);
+		arithmeticResult(d, result);
+		sr_toggle(CCR_C, _subtract ? source > shifted : result < shifted);
+		sr_toggle(CCR_V, overflow);
+		limit_arithmeticSaturation(d);
+		sr_z_update(d);
+		sr_l_update_by_v();
+		setCCRDirty(ab, d, CCR_E | CCR_U | CCR_N);
 	}
 
 	void DSP::alu_addl(bool ab)
 	{
-		TReg56&			d = ab ? reg.b : reg.a;
-		const TReg56&	s = ab ? reg.a : reg.b;
-
-		const TReg56 old = d;
-		const TInt64 res = (aluSignextend(d) << 1) + aluSignextend(s);
-		d.var = res;
-		aluMask(d);
-
-		sr_z_update(d);
-		sr_clear(CCR_V);		// I did not manage to make the ALU overflow in the simulator, apparently that SR bit is only used for other ops
-		//sr_l_update_by_v();
-		sr_c_update_arithmetic(old,d);
-		setCCRDirty(ab, d, CCR_E | CCR_U | CCR_N);
+		alu_shiftedArithmetic(ab, true, false);
 	}
 
 	void DSP::alu_addr(bool ab)
 	{
-		TReg56& d = ab ? reg.b : reg.a;
-		const TReg56& s = ab ? reg.a : reg.b;
-
-		uint64_t res = static_cast<uint64_t>(d.var) >> 1;
-		res |= static_cast<uint64_t>(d.var) & (1ull<<(55 + g_aluShift));
-
-		const uint64_t halved = res;
-		res += static_cast<uint64_t>(s.var);
-
-		const auto carry = res < halved;	// carry out of the accumulator
-
-		d.var = res;
-		aluMask(d);
-
-		sr_z_update(d);
-		sr_v_update(res, d);
-		sr_l_update_by_v();
-		sr_toggle(CCR_C, carry);
-		setCCRDirty(ab, d, CCR_E | CCR_U | CCR_N);
+		alu_shiftedArithmetic(ab, false, false);
 	}
 
-	void DSP::alu_rol(const bool ab)
+	void DSP::alu_rotate(const bool ab, const bool _right)
 	{
-		auto& d = ab ? reg.b.var : reg.a.var;
-
-		const auto c = bitvalue<uint64_t,47 + g_aluShift>(d);
-		auto shifted = d;
-		reinterpret_cast<uint64_t&>(shifted) >>= (24 + g_aluShift);	// cut LSBs
-		shifted <<= 1;
-		shifted |= sr_val(CCRB_C);
-		shifted &= 0xffffff;
-		shifted <<= (24 + g_aluShift);			// move back
-		
-		d &= static_cast<TInt64>(0xff000000ffffff00ull);
-		d |= shifted;
-
-		sr_toggle(CCRB_N, bitvalue<uint64_t, 47 + g_aluShift>(shifted));	// Set if bit 47 of the result is set
-		sr_toggle(CCR_Z, shifted == 0);						// Set if bits 47�24 of the result are 0
-		sr_clear(CCR_V);									// This bit is always cleared
-		sr_toggle(CCRB_C, c);								// Set if bit 47 of the destination operand is set, and cleared otherwise
+		const unsigned pad = isSixteenBitArithmetic() ? 8 : 0, width = 24 - pad;
+		const uint32_t value = (ab ? b1() : a1()).toWord() >> pad;
+		const uint32_t carry = sr_val(CCRB_C);
+		const uint32_t result = (_right ? (value >> 1) | (carry << (width - 1)) : (value << 1) | carry) & ((1u << width) - 1);
+		if(ab) b1(TReg24(result << pad)); else a1(TReg24(result << pad));
+		sr_toggle(CCR_N, (result & (1u << (width - 1))) != 0);
+		sr_toggle(CCR_Z, result == 0);
+		sr_clear(CCR_V);
+		sr_toggle(CCR_C, ((value >> (_right ? 0 : width - 1)) & 1) != 0);
 	}
 
 	void DSP::alu_clr(bool ab)
@@ -379,33 +343,34 @@ namespace dsp56k
 	// _____________________________________________________________________________
 	// alu_mpy
 	//
-	void DSP::alu_mpy( bool ab, const TReg24& _s1, const TReg24& _s2, bool _negate, bool _accumulate )
+	void DSP::alu_mpy( bool ab, const TReg24& _s1, const TReg24& _s2, bool _negate, bool _accumulate, bool _round )
 	{
 	//	assert( sr_test(SR_S0) == 0 && sr_test(SR_S1) == 0 );
 
-		const int64_t s1 = _s1.signextend<int64_t>();
-		const int64_t s2 = _s2.signextend<int64_t>();
+		const int64_t s1 = (isSixteenBitArithmetic() ? (_s1.signextend<int64_t>() & ~255ll) : _s1.signextend<int64_t>());
+		const int64_t s2 = (isSixteenBitArithmetic() ? (_s2.signextend<int64_t>() & ~255ll) : _s2.signextend<int64_t>());
 
-		auto res = s1 * s2;
+		uint64_t res = static_cast<uint64_t>(s1 * s2);
 
 		// fractional multiplication requires one post-shift; the same shift scales the product
 		// into the left-aligned ALU domain before it meets the accumulator
 		res <<= (1 + g_aluShift);
 
 		if( _negate )
-			res = -res;
+			res = uint64_t(0) - res;
 
 		TReg56& d = ab ? reg.b : reg.a;
 
 		if( _accumulate )
-			res += aluSignextend(d);
+			res += arithmeticValue(d);
 
-		d.var = res;
-		aluMask(d);
+		arithmeticResult(d, res);
 
-		// Update SR
-		sr_z_update(d);
+		// Rounded products must not saturate or set L at an intermediate stage.
+		if(_round) { alu_rnd(ab); return; }
 		sr_v_update(res,d);
+		limit_arithmeticSaturation(d);
+		sr_z_update(d);
 
 		sr_l_update_by_v();
 
@@ -422,6 +387,8 @@ namespace dsp56k
 	void DSP::alu_mpysuuu( bool ab, TReg24 _s1, TReg24 _s2, bool _negate, bool _accumulate, bool _suuu )
 	{
 	//	assert( sr_test(SR_S0) == 0 && sr_test(SR_S1) == 0 );
+
+		if(isSixteenBitArithmetic()) { _s1.var &= ~255; _s2.var &= ~255; }
 
 		TInt64 res;
 
@@ -442,10 +409,9 @@ namespace dsp56k
 		const TReg56 old = d;
 
 		if( _accumulate )
-			res += aluSignextend(d);
+			res += static_cast<int64_t>(arithmeticValue(d));
 
-		d.var = res;
-		aluMask(d);
+		arithmeticResult(d, res);
 
 		// Update SR
 		sr_z_update( d );
@@ -503,6 +469,8 @@ namespace dsp56k
 	{
 		assert( sr_test(SR_S0) == 0 && sr_test(SR_S1) == 0 );
 
+		if(isSixteenBitArithmetic()) { _s1.var &= ~255; _s2.var &= ~255; }
+
 		TInt64 res;
 
 		if( _uu )
@@ -519,13 +487,11 @@ namespace dsp56k
 
 		TReg56& d = ab ? reg.b : reg.a;
 
-		res += d.var;
+		res += arithmeticValue(d);
 
 		const TReg56 old = d;
 
-		d.var = res;
-
-		aluMask(d);
+		arithmeticResult(d, res);
 
 		// Update SR
 		sr_z_update( d );
@@ -542,29 +508,31 @@ namespace dsp56k
 	{
 		TReg56& _alu = ab ? reg.b : reg.a;
 
-		int64_t rounder = 0x800000ll << g_aluShift;	// the rounding position moves up with the ALU
+		auto value = arithmeticValue(_alu);
+		int64_t rounder = 0x800000ll << (g_aluShift + (isSixteenBitArithmetic() ? 8 : 0));	// the rounding position moves up with the ALU
 
 		if		(sr_test_noCache(SR_S1)) rounder>>=1;
 		else if	(sr_test_noCache(SR_S0)) rounder<<=1;
 		
-		_alu.var += rounder;
+		value += rounder;
 
 		const auto mask = (rounder<<1)-1;		// all the bits to the right of, and including the rounding position
 
 		if (!sr_test_noCache(SR_RM))			// convergent rounding. If all mask bits are cleared
 		{
-			if (!(_alu.var & mask)) 
-				_alu.var&=~(rounder<<1);		// then the bit to the left of the rounding position is cleared in the result
+			if (!(value & mask))
+				value&=~(rounder<<1);		// then the bit to the left of the rounding position is cleared in the result
 		}
 
-		_alu.var&=~mask;						// all bits to the right of and including the rounding position are cleared.
+		value&=~mask;						// all bits to the right of and including the rounding position are cleared.
 
-		const auto res = _alu.var;
+		const auto res = value;
 
-		aluMask(_alu);
+		arithmeticResult(_alu, value);
 
-		sr_z_update(_alu);
 		sr_v_update(res, _alu);
+		limit_arithmeticSaturation(_alu, true);
+		sr_z_update(_alu);
 
 		sr_l_update_by_v();
 		setCCRDirty(ab, _alu, CCR_E | CCR_U | CCR_N);
@@ -582,12 +550,7 @@ namespace dsp56k
 
 		decode_QQQ_read(s1, s2, qqq);
 
-		alu_mpy(ab, s1, s2, negative, mulAcc);
-
-		if(round)
-		{
-			alu_rnd(ab);
-		}
+		alu_mpy(ab, s1, s2, negative, mulAcc, round);
 
 		return true;
 	}
@@ -1097,7 +1060,7 @@ namespace dsp56k
 		const TReg24 s1 = decode_QQ_read( qq );
 		const TReg24 s2( decode_sssss(sssss) );
 
-		alu_mac( ab, s1, s2, negate, false );		
+		alu_mpy(ab, s1, s2, negate, true);
 	}
 	inline void DSP::op_Maci_xxxx(const TWord op)
 	{
@@ -1137,8 +1100,7 @@ namespace dsp56k
 		const TReg24 s1 = decode_QQ_read( qq );
 		const TReg24 s2( decode_sssss(sssss) );
 
-		alu_mac( ab, s1, s2, negate, false );
-		alu_rnd( ab );
+		alu_mpy(ab, s1, s2, negate, true, true);
 	}
 	inline void DSP::op_Macri_xxxx(const TWord op)
 	{
@@ -1232,8 +1194,7 @@ namespace dsp56k
 		const TReg24 s1 = decode_QQ_read(QQ);
 		const TReg24 s2 = TReg24( decode_sssss(sssss) );
 
-		alu_mpy( ab, s1, s2, negate, false );
-		alu_rnd( ab );
+		alu_mpy(ab, s1, s2, negate, false, true);
 	}
 	inline void DSP::op_Mpyri(const TWord op)
 	{
@@ -1290,30 +1251,11 @@ namespace dsp56k
 	inline void DSP::op_Rol(const TWord op)
 	{
 		const auto D = getFieldValue<Rol, Field_d>(op);
-		alu_rol(D);
+		alu_rotate(D, false);
 	}
 	inline void DSP::op_Ror(const TWord op)
 	{
-		const auto D = getFieldValue<Ror, Field_d>(op);
-
-		auto& d = D ? reg.b.var : reg.a.var;
-
-		const auto c = bitvalue<uint64_t,24 + g_aluShift>(d);	// bit 24 = LSB of a1/b1
-		auto shifted = d;
-		reinterpret_cast<uint64_t&>(shifted) >>= (24 + g_aluShift);	// isolate a1/b1
-		const auto oldBit0 = shifted & 1;
-		shifted >>= 1;									// shift right
-		shifted |= static_cast<TInt64>(sr_val(CCRB_C)) << 23;	// inject old carry into bit 23 (MSB position)
-		shifted &= 0xffffff;
-		shifted <<= (24 + g_aluShift);					// move back
-
-		d &= static_cast<TInt64>(0xff000000ffffff00ull);
-		d |= shifted;
-
-		sr_toggle(CCRB_N, bitvalue<uint64_t, 47 + g_aluShift>(shifted));
-		sr_toggle(CCR_Z, shifted == 0);
-		sr_clear(CCR_V);
-		sr_toggle(CCRB_C, static_cast<Bit>(oldBit0));
+		alu_rotate(getFieldValue<Ror, Field_d>(op), true);
 	}
 	inline void DSP::op_Sbc(const TWord op)
 	{
@@ -1342,38 +1284,13 @@ namespace dsp56k
 	}
 	inline void DSP::op_Subl(const TWord op)
 	{
-		const auto ab = getFieldValue<Subl, Field_d>(op);
-
-		TReg56&			d = ab ? reg.b : reg.a;
-		const TReg56&	s = ab ? reg.a : reg.b;
-
-		const TReg56 old = d;
-		const TInt64 res = (aluSignextend(d) << 1) - aluSignextend(s);
-		d.var = res;
-		aluMask(d);
-		// Carry bit note: "The Carry bit (C) is set correctly if the source operand does not overflow as a result of the left shift operation.", we do not care at the moment
-		sr_toggle(CCR_V, bittest(old, 55 + g_aluShift) != bittest(d, 55 + g_aluShift));
-		sr_z_update(d);
-		//sr_l_update_by_v();
-		sr_c_update_arithmetic(old, d);
-		setCCRDirty(ab, d, CCR_E | CCR_U | CCR_N);
+		alu_shiftedArithmetic(getFieldValue<Subl, Field_d>(op), true, true);
 	}
 	inline void DSP::op_Subr(const TWord op)
 	{
-		const auto ab = getFieldValue<Subr, Field_d>(op);
-
-		TReg56&			d = ab ? reg.b : reg.a;
-		const TReg56&	s = ab ? reg.a : reg.b;
-
-		const TReg56 old = d;
-		const TInt64 res = (aluSignextend(d) >> 1) - aluSignextend(s);
-		d.var = res;
-		aluMask(d);
-		sr_z_update(d);
-		//sr_l_update_by_v();
-		sr_c_update_arithmetic(old, d);
-		setCCRDirty(ab, d, CCR_E | CCR_U | CCR_N);
+		alu_shiftedArithmetic(getFieldValue<Subr, Field_d>(op), false, true);
 	}
+
 	inline void DSP::op_Tfr(const TWord op)
 	{
 		const auto D = getFieldValue<Tfr, Field_d>(op);

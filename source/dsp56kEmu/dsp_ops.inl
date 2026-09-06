@@ -436,6 +436,7 @@ namespace dsp56k
 		const auto sss = getFieldValue<Normf, Field_sss>(op);
 		const auto D = getFieldValue<Normf, Field_D>(op);
 
+		const bool carry = sr_test(CCR_C);
 		const TWord s = decode_sss_read<TWord>(sss);
 
 		if(!bittest(s, 23))
@@ -449,6 +450,7 @@ namespace dsp56k
 			const auto negS = static_cast<int>((-signextend<int,24>(s)) & 0xffffff);
 			alu_asl(D, D, negS);
 		}
+		sr_toggle(CCR_C, carry);
 	}
 
 	inline void DSP::op_Pflush(const TWord op)

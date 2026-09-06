@@ -120,8 +120,8 @@ namespace dsp56k
 			}
 			else if (moduloTest <= 0x007fff)
 			{
-				m_asm.mov(mask, asmjit::Imm(AGU::calcModuloMask(val)));
-				m_asm.mov(mod, asmjit::Imm(val + 1));
+				m_asm.mov(mask, asmjit::Imm(AGU::calcModuloMask(moduloTest)));
+				m_asm.mov(mod, asmjit::Imm(moduloTest + 1));
 			}
 			else
 			{
@@ -200,13 +200,14 @@ namespace dsp56k
 		// zero modulo = bitreverse
 		m_asm.bind(isBitreverse);
 		m_asm.clr(mod);
+		m_asm.clr(mask);
 		m_asm.jmp(end);
 
 		// modulo
 		m_asm.bind(isModulo);
 
 		const ShiftReg shifter(m_block);
-		m_asm.bsr(r32(shifter), r32(_src.get()));							// returns index of MSB that is 1
+		m_asm.bsr(r32(shifter), mod);							// returns index of MSB that is 1
 		m_asm.mov(mask, asmjit::Imm(2));
 
 #ifdef HAVE_ARM64

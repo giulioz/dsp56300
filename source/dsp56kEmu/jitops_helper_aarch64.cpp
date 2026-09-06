@@ -228,6 +228,8 @@ namespace dsp56k
 	{
 		// Sixteen-bit Arithmetic mode (FM 3.5.1.2): scaling, limiting to 16 bits, the limited word on bus
 		// bits 15..0 with its sign extension on bits 23..16
+		m_asm.mov(_dst, _src);
+		packArithmeticSA(_dst);
 		const auto* mode = m_block.getMode();
 
 		if(mode)
@@ -237,14 +239,14 @@ namespace dsp56k
 				--shift;
 			if(mode->testSR(SRB_S0))
 				++shift;
-			m_asm.asr(_dst, _src, asmjit::Imm(shift));
+			m_asm.asr(_dst, _dst, asmjit::Imm(shift));
 		}
 		else
 		{
 			const ShiftReg shifter(m_block);
 			m_asm.bitTest(m_dspRegs.getSR(JitDspRegs::Read), SRB_S1);
 			m_asm.cset(shifter, asmjit::arm::CondCode::kNotZero);
-			m_asm.lsl(_dst, _src, shifter.get());
+			m_asm.lsl(_dst, _dst, shifter.get());
 
 			m_asm.bitTest(m_dspRegs.getSR(JitDspRegs::Read), SRB_S0);
 			m_asm.cset(shifter, asmjit::arm::CondCode::kNotZero);

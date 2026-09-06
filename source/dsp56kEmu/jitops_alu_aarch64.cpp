@@ -51,6 +51,8 @@ namespace dsp56k
 	
 	void JitOps::alu_and(const TWord ab, DspValue& _v)
 	{
+		if(isSixteenBitArithmetic()) m_asm.and_(r32(_v), asmjit::Imm(0xffff00));
+
 		m_asm.shl(r64(_v), asmjit::Imm(24 + g_aluBitOffset));
 
 		AluRef alu(m_block, ab);
@@ -78,6 +80,7 @@ namespace dsp56k
 		if (_abDst != _abSrc)
 			m_dspRegs.getALU(alu.get(), _abSrc);
 
+		packArithmeticSA(alu);
 		aluSignextendTo64(alu);
 
 		const RegGP oldAlu(m_block);
@@ -88,8 +91,17 @@ namespace dsp56k
 		else
 			m_asm.lsl(alu, alu, asmjit::Imm(_immediate));
 
-		// carry is the last bit shifted out so in our case its 56
-		copyBitToCCR(alu, 56, CCRB_C);
+		// The left-aligned accumulator loses its carry above host bit 63.
+		// Recover it from the source; bit 56 of the result is an accumulator data bit.
+		if(g_leftAlignedAlu || isSixteenBitArithmetic())
+		{
+			const RegScratch carry(m_block);
+			m_asm.lsr(carry, oldAlu, asmjit::Imm(1));
+			if(_v) m_asm.lsl(carry, carry, _v->get());
+			else m_asm.lsl(carry, carry, asmjit::Imm(_immediate));
+			copyBitToCCR(carry, 63, CCRB_C);
+		}
+		else copyBitToCCR(alu, 56, CCRB_C);
 
 		// Overflow: Set if Bit 55 is changed any time during the shift operation, cleared otherwise.
 		// The easiest way to check this is to shift back and compare if the initial alu value is identical ot the backshifted one
@@ -107,6 +119,7 @@ namespace dsp56k
 
 		m_dspRegs.mask56(alu);
 
+		unpackArithmeticSA(alu);
 		ccr_dirty(_abDst, alu, static_cast<CCRMask>(CCR_E | CCR_N | CCR_U | CCR_Z));
 	}
 	
@@ -118,18 +131,20 @@ namespace dsp56k
 
 		const CcrBatchUpdate bu(*this, CCR_C, CCR_V);
 
+		packArithmeticSA(alu);
 		aluExtendTo64(alu);						// make sign-extend possible in our wide registers
 		if(_v)
 			m_asm.asr(alu, alu, _v->get());
 		else
 			m_asm.asr(alu, alu, asmjit::Imm(_immediate));
 
-		copyBitToCCR(alu, 7, CCRB_C);			// carry is the last bit shifted out, we can grab it at bit pos 7 now as we pre-shifted left by 8
+		copyBitToCCR(alu, isSixteenBitArithmetic() ? 23 : 7, CCRB_C);			// carry is the last bit shifted out, we can grab it at bit pos 7 now as we pre-shifted left by 8
 
 		aluRestoreFrom64(alu);					// discards bits below the accumulator - the hardware has no resolution there
 
 //		ccr_clear(CCR_V);						// cleared by batch update
 
+		unpackArithmeticSA(alu);
 		ccr_dirty(_abDst, alu, static_cast<CCRMask>(CCR_E | CCR_N | CCR_U | CCR_Z));
 	}
 
@@ -151,50 +166,9 @@ namespace dsp56k
 		m_asm.eor(_dst.get(), _dst.get(), asmjit::Imm(1ull << _bit));
 	}
 
-	void JitOps::alu_lsl(TWord ab, const DspValue& _shiftAmount)
-	{
-		DspValue d(m_block);
-		getALU1(d, ab);
-
-		if(_shiftAmount.isImm24())
-			m_asm.lsl(r32(d), r32(d), asmjit::Imm(_shiftAmount.imm24()));
-		else
-			m_asm.lsl(r32(d), r32(d), _shiftAmount.get());
-
-		copyBitToCCR(r32(d), 24, CCRB_C);
-
-		m_asm.ands(r32(d), r32(d), asmjit::Imm(0xffffff));
-		ccr_update_ifZero(CCRB_Z);
-
-		copyBitToCCR(r32(d.get()), 23, CCRB_N);
-		ccr_clear(CCR_V);
-
-		setALU1(ab, d);
-	}
-
-	void JitOps::alu_lsr(TWord ab, const DspValue& _shiftAmount)
-	{
-		DspValue d(m_block);
-		getALU1(d, ab);
-		m_asm.lsl(r32(d), r32(d), asmjit::Imm(1));		// we need to preseve the carry bit to be able to copy it
-		if(_shiftAmount.isImm24())
-			m_asm.lsr(r32(d), r32(d), asmjit::Imm(_shiftAmount.imm24()));
-		else
-			m_asm.lsr(r32(d), r32(d), _shiftAmount.get());
-
-		copyBitToCCR(r32(d), 0, CCRB_C);
-		m_asm.lsr(r32(d), r32(d), asmjit::Imm(1));
-
-		m_asm.test_(r32(d.get()));
-		ccr_update_ifZero(CCRB_Z);
-		copyBitToCCR(r32(d), 23, CCRB_N);
-
-		ccr_clear(CCR_V);
-		setALU1(ab, d);
-	}
-
 	void JitOps::alu_rnd(TWord ab, const JitReg64& d, const bool _needsSignextend/* = true*/)
 	{
+		packArithmeticSA(d);
 		if(_needsSignextend)
 			aluSignextendTo64(d);
 
@@ -204,7 +178,7 @@ namespace dsp56k
 
 		if(mode)
 		{
-			uint64_t r = 0x800000ull << g_aluBitOffset;
+			uint64_t r = 0x800000ull << (g_aluBitOffset + (isSixteenBitArithmetic() ? 8 : 0));
 
 			if(mode->testSR(SRB_S1))	r >>= 1;
 			if(mode->testSR(SRB_S0))	r <<= 1;
@@ -213,7 +187,7 @@ namespace dsp56k
 		}
 		else
 		{
-			m_asm.mov(rounder, asmjit::Imm(0x800000ull << g_aluBitOffset));
+			m_asm.mov(rounder, asmjit::Imm(0x800000ull << (g_aluBitOffset + (isSixteenBitArithmetic() ? 8 : 0))));
 
 			const ShiftReg shifter(m_block);
 			m_asm.mov(shifter, asmjit::a64::xzr);
@@ -268,7 +242,9 @@ namespace dsp56k
 			m_asm.bic(d, d, mask.get());
 		}
 
-		ccr_dirty(ab, d, static_cast<CCRMask>(CCR_E | CCR_N | CCR_U | CCR_Z | CCR_V));
+		unpackArithmeticSA(d);
+		const auto vBit = arithmeticSaturation(d, true) ? 0 : CCR_V;
+		ccr_dirty(ab, d, static_cast<CCRMask>(CCR_E | CCR_N | CCR_U | CCR_Z | vBit));
 		m_dspRegs.mask56(d);
 	}
 
@@ -385,9 +361,10 @@ namespace dsp56k
 		m_asm.csel(r32(t), r32(t), asmjit::a64::regs::wzr, asmjit::arm::CondCode::kNotZero);
 
 		CcrBatchUpdate ccrBatch(*this, CCR_N, CCR_Z, CCR_V);
-		copyBitToCCR(d, 23 + g_aluBitOffset, CCRB_N);
+		copyBitToCCR(r32(t), 23, CCRB_N);
 
 		m_asm.lsl(r64(d), r64(t), asmjit::Imm(24 + g_aluBitOffset));
+		m_asm.test_(r32(t));
 		ccr_update_ifZero(CCRB_Z);
 	}
 
@@ -687,88 +664,6 @@ namespace dsp56k
 		ccr_clear(CCR_V);								// Always cleared
 	}
 
-	void JitOps::op_Rol(TWord op)
-	{
-		const auto D = getFieldValue<Rol, Field_d>(op);
-
-		DspValue r(m_block);
-		getALU1(r, D);
-
-		const RegGP prevCarry(m_block);
-		ccr_getBitValue(prevCarry, CCRB_C);
-
-		copyBitToCCR(r32(r), 23, CCRB_C);				// Set if bit 47 of the destination operand is set, and cleared otherwise
-
-		m_asm.shl(r.get(), asmjit::Imm(1));
-		ccr_n_update_by23(r64(r));						// Set if bit 47 of the result is set
-
-		m_asm.orr(r.get(), r.get(), r32(prevCarry.get()));
-		m_asm.test_(r32(r));
-		ccr_update_ifZero(CCRB_Z);							// Set if bits 47�24 of the result are 0
-
-		setALU1(D, r);
-
-		ccr_clear(CCR_V);									// This bit is always cleared
-	}
-
-	void JitOps::op_Ror(TWord op)
-	{
-		const auto D = getFieldValue<Ror, Field_d>(op);
-
-		DspValue r(m_block);
-		getALU1(r, D);
-
-		const RegGP prevCarry(m_block);
-		ccr_getBitValue(prevCarry, CCRB_C);
-
-		copyBitToCCR(r32(r), 0, CCRB_C);				// C = bit 24 of the destination
-
-		m_asm.shr(r.get(), asmjit::Imm(1));
-		m_asm.bfi(r.get(), r32(prevCarry.get()), asmjit::Imm(23), asmjit::Imm(1));
-
-		m_asm.test_(r32(r));
-		ccr_update_ifZero(CCRB_Z);							// Set if bits 47-24 of the result are 0
-		ccr_n_update_by23(r64(r));							// Set if bit 47 of the result is set
-
-		setALU1(D, r);
-
-		ccr_clear(CCR_V);									// This bit is always cleared
-	}
-
-	void JitOps::op_Subl(TWord op)
-	{
-		const auto ab = getFieldValue<Subl, Field_d>(op);
-
-		AluRef d(m_block, ab ? 1 : 0, true, true);
-
-		const RegGP oldBit55(m_block);
-		m_asm.bitTest(d, 55 + g_aluBitOffset);
-		m_asm.cset(r32(oldBit55), asmjit::arm::CondCode::kNotZero);
-
-		aluSignextendTo64(d);
-		m_asm.shl(d, asmjit::Imm(1));
-
-		{
-			const RegGP s(m_block);
-			aluSignextendTo64(s, r64(m_dspRegs.getALU(ab ? 0 : 1)));
-
-			m_asm.sub(d, s);
-		}
-
-		ccr_dirty(ab ? 1 : 0, d, static_cast<CCRMask>(CCR_E | CCR_U | CCR_N | CCR_Z));
-
-		const RegGP newBit55(m_block);
-		m_asm.bitTest(d, 55 + g_aluBitOffset);
-		m_asm.cset(r32(newBit55), asmjit::arm::CondCode::kNotZero);
-
-		m_asm.eor(r32(oldBit55), r32(oldBit55), r32(newBit55));
-		copyBitToCCR(r32(oldBit55), 0, CCRB_V);
-
-		// Carry bit note: "The Carry bit (C) is set correctly if the source operand does not overflow as a result of the left shift operation.", we do not care at the moment
-		copyBitToCCR(r32(oldBit55), 0, CCRB_C);
-
-		m_dspRegs.mask56(d);
-	}
 }
 
 #endif

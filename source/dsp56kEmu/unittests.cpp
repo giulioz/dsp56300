@@ -2702,7 +2702,9 @@ namespace dsp56k
 		{
 			verify(dsp.aluA().var == 0x7fffffffffffff);
 			verify(!dsp.sr_test(CCR_C));
-			verify(!dsp.sr_test(CCR_V));
+			// Minimum signed 56-bit value minus one overflows (FM table 5-1).
+			verify(dsp.sr_test(CCR_V));
+			verify(dsp.sr_test(CCR_L));
 		});
 
 		runTest([&]()
@@ -3261,7 +3263,7 @@ namespace dsp56k
 			dsp.setSR(dsp.getSR().var & ~SR_SA);
 		});
 
-		// L moves of a full accumulator: X[15..0] -> bits 47..32, Y[15..0] -> bits 31..16 and back, 32-bit limited
+		// L moves of a full accumulator: X[15..0] -> bits 47..32, Y[15..0] -> bits 23..8 and back, 32-bit limited
 		runTest([&]()
 		{
 			dsp.setSR(SR_SA);
@@ -3271,7 +3273,7 @@ namespace dsp56k
 			emit(0x488600);	// move l:$6,a
 		}, [&]()
 		{
-			verify(dsp.aluA().var == 0x00123456780000);
+			verify(dsp.aluA().var == 0x00123400567800);
 			dsp.setSR(dsp.getSR().var & ~SR_SA);
 		});
 
@@ -3283,15 +3285,15 @@ namespace dsp56k
 			emit(0x488600);	// move l:$6,a
 		}, [&]()
 		{
-			verify(dsp.aluA().var == 0xff8001ffff0000);
+			verify(dsp.aluA().var == 0xff800100ffff00);
 			dsp.setSR(dsp.getSR().var & ~SR_SA);
 		});
 
 		runTest([&]()
 		{
 			dsp.setSR(SR_SA);
-			dsp.setALU(false, TReg56(static_cast<TReg56::MyType>(0xff8001ffff0000)));
-			emit(0x484700);	// move a,l:$7
+			dsp.setALU(false, TReg56(static_cast<TReg56::MyType>(0xff800100ffff00)));
+			emit(0x480700);	// move a,l:$7
 		}, [&]()
 		{
 			verify(dsp.memory().get(MemArea_X, 7) == 0xff8001);
@@ -3304,7 +3306,7 @@ namespace dsp56k
 		{
 			dsp.setSR(SR_SA);
 			dsp.setALU(false, TReg56(static_cast<TReg56::MyType>(0x01000000000000)));
-			emit(0x484700);	// move a,l:$7
+			emit(0x480700);	// move a,l:$7
 		}, [&]()
 		{
 			verify(dsp.memory().get(MemArea_X, 7) == 0x007fff);
@@ -3331,7 +3333,7 @@ namespace dsp56k
 		{
 			dsp.setSR(SR_SA);
 			dsp.setALU(false, TReg56(static_cast<TReg56::MyType>(0x00123456789abc)));
-			emit(0x404700);	// move a10,l:$7
+			emit(0x400700);	// move a10,l:$7
 		}, [&]()
 		{
 			verify(dsp.memory().get(MemArea_X, 7) == 0x001234);
@@ -3339,7 +3341,7 @@ namespace dsp56k
 			dsp.setSR(dsp.getSR().var & ~SR_SA);
 		});
 
-		// 48-bit X as an ALU operand: X1[23..8] -> 47..32, X0[23..8] -> 31..16
+		// 48-bit X as an ALU operand: X1[23..8] -> 47..32, X0[23..8] -> 23..8
 		runTest([&]()
 		{
 			dsp.setSR(SR_SA);
@@ -3349,7 +3351,7 @@ namespace dsp56k
 			emit("add x,a");
 		}, [&]()
 		{
-			verify(dsp.aluA().var == 0x00123456780000);
+			verify(dsp.aluA().var == 0x00123400567800);
 			dsp.setSR(dsp.getSR().var & ~SR_SA);
 		});
 	}

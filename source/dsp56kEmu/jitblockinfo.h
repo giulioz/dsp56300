@@ -59,6 +59,11 @@ namespace dsp56k
 			branchIsConditional = false;
 			loopBegin = g_invalidAddress;
 			loopEnd = g_invalidAddress;
+			// Runtime block objects are pooled. A new jump-only block must not
+			// inherit a previous ALU block's flag-overwrite assumptions.
+			ccrRead = 0;
+			ccrWrite = 0;
+			ccrOverwrite = 0;
 		}
 
 		TerminationReason terminationReason = TerminationReason::None;

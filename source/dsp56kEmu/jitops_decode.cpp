@@ -615,6 +615,7 @@ namespace dsp56k
 	}
 	void JitOps::decode_LLL_read(TWord _lll, DspValue& x, DspValue& y)
 	{
+		if(_lll == 4 || _lll == 5) updateTransferScalingFlag();
 		x.temp(DspValue::Temp24);
 		y.temp(DspValue::Temp24);
 

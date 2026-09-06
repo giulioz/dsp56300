@@ -25,7 +25,9 @@ namespace dsp56k
 		if(diff < m_cyclesPerSample)
 			return (static_cast<uint32_t>(m_cyclesPerSample - diff)) >> static_cast<uint32_t>(m_clockSource);	// see explanation at end of this func
 
-		m_lastClock += m_cyclesPerSample;
+		const auto elapsedPeriod = m_cyclesPerSample;
+		m_lastClock += elapsedPeriod;
+		advancePeriod();
 
 		auto advanceClock = [](Clock& _c)
 		{
@@ -54,10 +56,11 @@ namespace dsp56k
 		for(size_t i=0; i<txCount; ++i) processTx[i]->execTX();
 		for(size_t i=0; i<rxCount; ++i) processRx[i]->execRX();
 
-		if(diff >= (m_cyclesPerSample<<1))
+		const auto nextDeadline = static_cast<uint64_t>(elapsedPeriod) + m_cyclesPerSample;
+		if(diff >= nextDeadline)
 			return 0;
 
-		const auto delay = static_cast<uint32_t>((m_cyclesPerSample << 1) - diff);
+		const auto delay = static_cast<uint32_t>(nextDeadline - diff);
 
 		// if the clock source is not instructions but cycles, we will miss frames if we return the cycle delay here because
 		// peripherals are processed via instruction counts. Return only half of the cycles in this case
@@ -118,6 +121,9 @@ namespace dsp56k
 	void EsxiClock::restartClock()
 	{
 		m_lastClock = *m_dspInstructionCounter;
+		// Ceil each cumulative deadline: never clock an external slot early.
+		m_periodPhase = m_periodDenominator - 1;
+		advancePeriod();
 		m_periph.setDelayCycles(0);
 	}
 
@@ -156,9 +162,10 @@ namespace dsp56k
 
 	void EsxiClock::updateCyclesPerSample()
 	{
-		uint32_t cyclesPerSample = m_fixedCyclesPerSample;
+		uint64_t numerator = m_fixedCyclesPerSample;
+		uint64_t denominator = 1;
 
-		if(!cyclesPerSample)
+		if(!numerator)
 		{
 			if(!m_pctl)
 				return;
@@ -172,29 +179,51 @@ namespace dsp56k
 			m_speedHz = static_cast<uint64_t>(m_externalClockFrequency) * static_cast<uint64_t>(mf) / (static_cast<uint64_t>(pd) * static_cast<uint64_t>(df));
 
 			if (m_samplerate)
-				cyclesPerSample = static_cast<uint32_t>((m_speedHz / m_samplerate) >> 1);	// 2 samples = 1 frame (stereo)
+			{
+				numerator = static_cast<uint64_t>(m_externalClockFrequency) * mf;
+				denominator = static_cast<uint64_t>(pd) * df * m_samplerate * 2; // two slots per stereo frame
+			}
 			else
-				cyclesPerSample = mf * 128 / pd;			// The ratio between external clock and sample period simplifies to this.
-
-			cyclesPerSample *= m_speedPercent;
-			cyclesPerSample /= 100;
+				numerator = mf * 128 / pd;			// The ratio between external clock and sample period simplifies to this.
 
 			// A more full expression would be m_cyclesPerSample = dsp_frequency / samplerate, where
 			// dsp_frequency = m_extClock * mf / pd and samplerate = m_extClock/256
 
 			const auto speedMhz = static_cast<double>(m_speedHz) / 1000000.0f * m_speedPercent / 100.0f;
-			LOG("Clock speed changed to: " << speedMhz << " Mhz, EXTAL=" << m_externalClockFrequency << " Hz, PCTL=" << HEX(m_pctl) << ", mf=" << HEX(mf) << ", pd=" << HEX(pd) << ", df=" << HEX(df) << " => cycles per sample=" << std::dec << cyclesPerSample << ", predefined samplerate=" << m_samplerate);
+			LOG("Clock speed changed to: " << speedMhz << " Mhz, EXTAL=" << m_externalClockFrequency << " Hz, PCTL=" << HEX(m_pctl) << ", mf=" << HEX(mf) << ", pd=" << HEX(pd) << ", df=" << HEX(df) << " => cycles per sample=" << std::dec << static_cast<double>(numerator) / denominator * m_speedPercent / 100.0 << ", predefined samplerate=" << m_samplerate);
+		}
+		// Keep the fractional external-clock interval instead of losing it on
+		// every slot (76 MHz / 88.2 kHz is 861 + 299/441 cycles).
+		// Clamp nonsensical overclock settings rather than wrapping the scheduler.
+		denominator *= 100;
+		if(numerator > std::numeric_limits<uint64_t>::max() / m_speedPercent)
+		{
+			m_periodWhole = std::numeric_limits<uint32_t>::max();
+			m_periodRemainder = 0;
+			m_periodDenominator = 1;
 		}
 		else
 		{
-			cyclesPerSample *= m_speedPercent;
-			cyclesPerSample /= 100;
+			numerator *= m_speedPercent;
+			const auto whole = numerator / denominator;
+			m_periodWhole = static_cast<uint32_t>(std::clamp<uint64_t>(whole, 1, std::numeric_limits<uint32_t>::max()));
+			m_periodRemainder = whole == m_periodWhole && whole < std::numeric_limits<uint32_t>::max() ? numerator % denominator : 0;
+			m_periodDenominator = denominator;
 		}
-
-		m_cyclesPerSample = cyclesPerSample;
-		m_lastClock = *m_dspInstructionCounter;
-		m_periph.setDelayCycles(0);
+		restartClock();
 	}
+
+	void EsxiClock::advancePeriod()
+	{
+		m_cyclesPerSample = m_periodWhole;
+		m_periodPhase += m_periodRemainder;
+		if(m_periodPhase >= m_periodDenominator)
+		{
+			m_periodPhase -= m_periodDenominator;
+			++m_cyclesPerSample;
+		}
+	}
+
 	void EsxiClock::setEsaiDivider(Esxi* _esai, const TWord _dividerTX, const TWord _dividerRX)
 	{
 		bool found = false;

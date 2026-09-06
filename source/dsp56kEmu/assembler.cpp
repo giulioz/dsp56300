@@ -189,8 +189,7 @@ namespace dsp56k
 	{
 		// _ab: true = destination is b, false = destination is a
 		// JJJ=1 means "other accumulator" (for Add/Sub etc)
-		// Note: for Tfr, JJJ=0 also falls through to mean "other accumulator" in the disassembler
-		// The caller is responsible for handling the JJJ=0 case for Tfr
+		// Callers using table 12-16 remap the other accumulator to JJJ=0.
 		const auto reg = toLower(_reg);
 
 		if (reg == "b" && !_ab) { _value = 1; return true; }	// b when dest is a
@@ -214,7 +213,8 @@ namespace dsp56k
 			{"x0,x0", 0}, {"y0,y0", 1}, {"x1,x0", 2}, {"y1,y0", 3},
 			{"x0,y1", 4}, {"y0,x0", 5}, {"x1,y0", 6}, {"y1,x1", 7}
 		};
-		const auto it = m.find(pair);
+		auto it = m.find(pair);
+		if (it == m.end()) it = m.find(r2 + "," + r1); // signed multiplication is commutative
 		if (it == m.end()) return false;
 		_value = it->second;
 		return true;
@@ -749,9 +749,13 @@ namespace dsp56k
 				TWord jjj;
 				if (!parseRegister_JJJ(ops[0], d != 0, jjj)) continue;
 
-				// For Tfr, Cmp_S1S2, Cmpm_S1S2: JJJ value 0 is not valid
-				if ((inst == Tfr || inst == Cmp_S1S2 || inst == Cmpm_S1S2) && jjj == 0)
-					continue;
+				// Table 12-16: other accumulator is JJJ=000, X/Y are unavailable.
+				// JJJ=001 aliases MAX/MAXM/RND for CMP/CMPM/TFR respectively.
+				if (inst == Cmp_S1S2 || inst == Cmpm_S1S2 || inst == Tfr)
+				{
+					if (jjj == 2 || jjj == 3) continue;
+					if (jjj == 1) jjj = 0;
+				}
 
 				setFieldValue(word, inst, Field_JJJ, jjj);
 				setFieldValue(word, inst, Field_d, d);
@@ -1426,7 +1430,10 @@ namespace dsp56k
 			case Mpy_su:
 			{
 				// Format: "macsu [-]x0,y0,a" or "mpyuu -x1,x0,b"
-				// The mnemonic already includes the su/uu suffix
+				// These variants require a suffix. The opcode mnemonic table also
+				// lists them under plain MAC/MPY; do not silently choose unsigned input.
+				if (_mnemonic != "macsu" && _mnemonic != "macuu" &&
+					_mnemonic != "mpysu" && _mnemonic != "mpyuu") continue;
 				bool negate = false;
 				std::string operandsCopy = _operands;
 				if (!operandsCopy.empty() && operandsCopy[0] == '-')
@@ -2031,8 +2038,9 @@ namespace dsp56k
 					setFieldValue(word, inst, Field_eeeeee, ee);
 					setFieldValue(word, inst, Field_W, 0);
 				}
-				else if (dstIsPCR && !srcIsPCR)
+				else if (dstIsPCR)
 				{
+					// Any on-chip register, including another PCR, may be the source (FM 13-130).
 					// regular register → PCR (write=1)
 					if (!parseRegister_dddddd(ops[0], ee)) continue;
 					parseRegister_DDDDD(ops[1], dd);
@@ -2042,7 +2050,7 @@ namespace dsp56k
 				}
 				else
 				{
-					continue; // ambiguous or both are PCR
+					continue; // neither operand is a control register
 				}
 				result.word[0] = word;
 				result.wordCount = 1;

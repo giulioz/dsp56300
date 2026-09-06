@@ -200,7 +200,7 @@ namespace dsp56k
 			m_debugger->onExec(vba);
 #endif
 
-		if(g_useJIT)
+		if(usesJit())
 		{
 			LOGJITPC(vba);
 			const auto pc = getPC();
@@ -331,7 +331,7 @@ namespace dsp56k
 		{
 			++m_instructions;
 
-			if constexpr(!g_useJIT)
+			if(!usesJit())
 				m_cycles += getOpcodeCycles(currentOp);
 
 			if(g_traceSupported && pcCurrentInstruction == currentOp)
@@ -411,8 +411,10 @@ namespace dsp56k
 
 	void DSP::setCCRDirty(bool ab, const TReg56& _alu, uint32_t _dirtyBitsMask)
 	{
-//		if(ccrCache.dirty && ccrCache.ab != ab)
-//			updateDirtyCCR();
+		// A single cached result backs all pending flags. Materialize flags
+		// preserved by this operation before replacing that cached result.
+		if(ccrCache.dirty & ~_dirtyBitsMask)
+			updateDirtyCCR();
 
 		ccrCache.dirty |= _dirtyBitsMask;
 		ccrCache.alu = _alu;
@@ -426,12 +428,13 @@ namespace dsp56k
 
 		auto& dsp = const_cast<DSP&>(*this);
 
+		const auto dirty = ccrCache.dirty;
 		dsp.ccrCache.dirty = 0;
-		
-//		dsp.sr_s_update();
-		dsp.sr_e_update(ccrCache.alu);
-		dsp.sr_u_update(ccrCache.alu);
-		dsp.sr_n_update(ccrCache.alu);
+		// A later logical instruction may already have replaced N while
+		// preserving E/U. Never overwrite a flag that is no longer pending.
+		if(dirty & CCR_E) dsp.sr_e_update(ccrCache.alu);
+		if(dirty & CCR_U) dsp.sr_u_update(ccrCache.alu);
+		if(dirty & CCR_N) dsp.sr_n_update(ccrCache.alu);
 	}
 
 	void DSP::sr_debug(char* _dst) const
@@ -499,7 +502,10 @@ namespace dsp56k
 		
 		sr_set( SR_LF );
 
-		if constexpr(!g_useJIT)
+		if(m_yieldInterpreterLoops)
+			return true; // execOp accounts for DO; subsequent steps run its body.
+
+		if(!usesJit())
 			m_cycles += getOpcodeCycles(pcCurrentInstruction);
 
 		++m_instructions;
@@ -560,7 +566,7 @@ namespace dsp56k
 		const auto lcBackup = reg.lc;
 		reg.lc.var = _loopCount;
 
-		if constexpr(!g_useJIT)
+		if(!usesJit())
 			m_cycles += getOpcodeCycles(pcCurrentInstruction);
 
 		++m_instructions;
@@ -583,7 +589,7 @@ namespace dsp56k
 			--reg.lc.var;
 			(this->*func)(op);
 			++m_instructions;
-			if constexpr(!g_useJIT)
+			if(!usesJit())
 				m_cycles += getOpcodeCycles(repeatedOpPC);
 //			traceOp();
 		}
@@ -1048,7 +1054,7 @@ namespace dsp56k
 	void DSP::notifyProgramMemWrite(TWord _offset)
 	{
 		m_opcodeCache[_offset].op = &DSP::op_ResolveCache;
-		if constexpr(!g_useJIT)
+		if(!usesJit())
 			m_opcodeCycleCache[_offset] = 0;
 
 #if DSP56300_DEBUGGER
@@ -1154,17 +1160,14 @@ namespace dsp56k
 	{
 		TReg56& d = ab ? reg.b : reg.a;
 
-		TInt64 d64 = aluSignextend(d);
-
-		d64 = d64 < 0 ? -d64 : d64;
-
-		d.var = d64;
-		aluMask(d);
+		const uint64_t value = arithmeticValue(d);
+		arithmeticResult(d, value & (1ull << 63) ? 0 - value : value);
+		sr_toggle(CCR_V, value == (1ull << 63));
+		limit_arithmeticSaturation(d);
 
 		sr_z_update(d);
-	//	sr_v_update(d);
-	//	sr_l_update_by_v();
-		setCCRDirty(ab, d, CCR_S | CCR_E | CCR_U | CCR_N);
+		sr_l_update_by_v();
+		setCCRDirty(ab, d, CCR_E | CCR_U | CCR_N);
 	}
 
 	void DSP::alu_tfr(const bool ab, const TReg56& src)
@@ -1186,16 +1189,14 @@ namespace dsp56k
 	{
 		TReg56& d = ab ? reg.b : reg.a;
 
-		auto d64 = aluSignextend(d);
-		d64 = -d64;
-		
-		d.var = d64;
-		aluMask(d);
+		const uint64_t value = arithmeticValue(d);
+		arithmeticResult(d, 0 - value);
+		sr_toggle(CCR_V, value == (1ull << 63));
+		limit_arithmeticSaturation(d);
 
 		sr_z_update(d);
-	//	TODO: how to update v? test in sim		sr_v_update(d);
 		sr_l_update_by_v();
-		setCCRDirty(ab, d, CCR_S | CCR_E | CCR_U | CCR_N);
+		setCCRDirty(ab, d, CCR_E | CCR_U | CCR_N);
 	}
 
 	void DSP::alu_not(const bool ab)
@@ -1233,8 +1234,8 @@ namespace dsp56k
 		}
 		else if( moduloTest <= 0x007fff )	// Modulo mode
 		{
-			reg.mMask[which] = AGU::calcModuloMask(val);
-			reg.mModulo[which] = val + 1;
+			reg.mMask[which] = AGU::calcModuloMask(moduloTest);
+			reg.mModulo[which] = moduloTest + 1;
 		}
 		else								// Multiple-wrap-around mode
 		{
@@ -1306,6 +1307,15 @@ namespace dsp56k
 		return dsp56k::calcCycles(instA, instB, _pc, opA, mem.getBridgedMemoryAddress(), 1);
 	}
 
+	void DSP::setUseJit(const bool _enabled)
+	{
+		assert(m_instructions == 0 && "select the execution engine before running the DSP");
+		m_useJit = _enabled && g_useJIT;
+		clearOpcodeCache();
+		if(usesJit())
+			m_jit.checkModeChange();
+	}
+
 	uint8_t DSP::getOpcodeCycles(const TWord _pc)
 	{
 		auto& cachedCycles = m_opcodeCycleCache[_pc];
@@ -1318,14 +1328,16 @@ namespace dsp56k
 	{
 		m_opcodeCache.clear();
 		m_opcodeCache.resize(mem.sizeP(), {&DSP::op_ResolveCache});
-		if constexpr(!g_useJIT)
+		if(!usesJit())
 			m_opcodeCycleCache.assign(mem.sizeP(), 0);
+		else
+			m_opcodeCycleCache.clear();
 	}
 
 	void DSP::clearOpcodeCache(const TWord _address)
 	{
 		m_opcodeCache[_address].op = &DSP::op_ResolveCache;
-		if constexpr(!g_useJIT)
+		if(!usesJit())
 			m_opcodeCycleCache[_address] = 0;
 		m_jit.notifyProgramMemWrite(_address);
 	}

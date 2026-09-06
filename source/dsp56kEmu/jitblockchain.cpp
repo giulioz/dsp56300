@@ -108,11 +108,29 @@ namespace dsp56k
 		m_jit.removeLoop(info);
 	}
 
+	JitBlockRuntimeData* JitBlockChain::getRepeatedBodyBlock(const TWord _pc) const
+	{
+		const auto op = m_jit.dsp().memory().get(MemArea_P, _pc);
+		Instruction a, b;
+		m_jit.dsp().opcodes().getInstructionTypes(op, a, b);
+		if(!(Opcodes::getFlags(a, b) & (OpFlagRepDynamic | OpFlagRepImmediate)))
+			return nullptr;
+		return getBlock(_pc + 1);
+	}
+
 	void JitBlockChain::create(const TWord _pc, bool _execute)
 	{
 //		LOG("Create @ " << HEX(_pc));// << std::endl << cacheEntry.block->getDisasm());
 
 		ensureCacheSize(_pc+1);
+
+		// REP emits its following instruction inside the same native block. Retire
+		// any standalone copy of that body before claiming both program words.
+		if(auto* body = getRepeatedBodyBlock(_pc))
+		{
+			assert(!isBeingGeneratedRecursive(body));
+			destroy(body);
+		}
 
 		auto& cacheEntry = m_jitCache[_pc];
 
@@ -315,6 +333,11 @@ namespace dsp56k
 			// If we jump into the middle of an existing block, this block needs to be regenerated.
 			// However, we can only destroy blocks that are not part of the recursive generation that is running at the moment
 			if (isBeingGeneratedRecursive(e.block))
+				return nullptr;
+
+			// A backward edge to REP can overlap the body currently being generated.
+			// Leave this edge to the dispatcher until that generation has finished.
+			if(isBeingGeneratedRecursive(getRepeatedBodyBlock(_pc)))
 				return nullptr;
 
 			// regenerate otherwise

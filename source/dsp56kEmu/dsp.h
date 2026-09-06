@@ -131,9 +131,11 @@ namespace dsp56k
 
 		std::vector<OpcodeCacheEntry>	m_opcodeCache;
 
-		// Per-PC instruction cycle count, filled lazily in interpreter builds. JIT builds leave
-		// this vector empty because they account cycles per compiled block. 0 = not yet computed.
+		// Per-PC instruction cycle count, allocated only for interpreter execution.
+		// JIT execution accounts cycles per block. 0 = not yet computed.
 		std::vector<uint8_t>			m_opcodeCycleCache;
+		bool m_useJit = g_useJIT;
+		bool m_yieldInterpreterLoops = false;
 		
 		InstructionCache				cache;
 
@@ -183,9 +185,17 @@ namespace dsp56k
 		TWord	getCurrentInstructionPC			() const									{ return pcCurrentInstruction; }
 		TWord	getCurrentInstructionSR			() const									{ return m_srCurrentInstruction; }
 
+		// Select before execution. Direct interpreter calls in a JIT-configured
+		// instance do not switch interrupt dispatch or cycle accounting.
+		void setUseJit(bool _enabled);
+		bool usesJit() const { return g_useJIT && m_useJit; }
+		// Let a board scheduler interleave other processors between DO-body
+		// instructions. REP remains atomic, as it is not interruptible.
+		void setYieldInterpreterLoops(bool _enabled) { m_yieldInterpreterLoops = _enabled; }
+
 		ASMJIT_FORCE_INLINE void exec() noexcept
 		{
-			if(g_useJIT)
+			if(usesJit())
 				execJit();
 			else
 				execInterpreter();
@@ -217,6 +227,16 @@ namespace dsp56k
 			const auto op = fetchPC();
 
 			execOp(op);
+			while(m_yieldInterpreterLoops && sr_test_noCache(SR_LF) && reg.pc.var == reg.la.var + 1)
+			{
+				if(reg.lc.var > 1)
+				{
+					--reg.lc.var;
+					setPC(hiword(reg.ss[ssIndex()]));
+				}
+				else
+					do_end();
+			}
 		}
 
 		template<typename Ta, typename Tb> void execPeriph() noexcept
@@ -463,14 +483,14 @@ namespace dsp56k
 
 		// -- status register management
 
-		void 	sr_set					( CCRMask _bits )					{ reg.sr.var |= _bits;	}
+		void 	sr_set					( CCRMask _bits )					{ ccrCache.dirty &= ~_bits; reg.sr.var |= _bits; }
 		void 	sr_set					( SRMask _bits )					{ reg.sr.var |= _bits;	}
-		void 	sr_clear				( CCRMask _bits )					{ reg.sr.var &= ~_bits; }
+		void 	sr_clear				( CCRMask _bits )					{ ccrCache.dirty &= ~_bits; reg.sr.var &= ~_bits; }
 		void 	sr_clear				( SRMask _bits )					{ reg.sr.var &= ~_bits; }
 
 		void 	sr_toggle				( CCRMask _bits, bool _set )		{ if( _set ) { sr_set(_bits); } else { sr_clear(_bits); } }
 		void 	sr_toggle				( SRMask _bits, bool _set )			{ if( _set ) { sr_set(_bits); } else { sr_clear(_bits); } }
-		void 	sr_toggle				( CCRBit _bit, Bit _value )			{ bitset<int32_t>(reg.sr.var, static_cast<int32_t>(_bit), _value); }
+		void 	sr_toggle				( CCRBit _bit, Bit _value )			{ ccrCache.dirty &= ~(1u << _bit); bitset<int32_t>(reg.sr.var, static_cast<int32_t>(_bit), _value); }
 
 	public:
 		int 	sr_test					( CCRMask _bits ) const				{ updateDirtyCCR(); return sr_test_noCache(_bits); }
@@ -564,17 +584,12 @@ namespace dsp56k
 		}
 
 		// value needs to fit into 48 (arithmetic saturation mode) or 56 bits
-		void sr_v_update( const int64_t& _notLimitedResult, TReg56& _result )
+		void sr_v_update(const int64_t& _notLimitedResult, TReg56& _result)
 		{
-			if( sr_test_noCache(SR_SM) )
-			{
-				const unsigned int test=static_cast<unsigned int>(_result.var>>(47 + g_aluShift))&0x13;
-				if (!(test ^ 0x13) || !(test)) sr_set(CCR_V);
-			}
-			else
-			{
-				sr_toggle( CCR_V, ((_notLimitedResult>>(48 + g_aluShift))^(_result.var>>(48 + g_aluShift)))&255);
-			}
+			// Arithmetic saturation is instruction-specific and applied separately.
+			// Mixed/unsigned multiply and BFU instructions explicitly ignore SM.
+			sr_toggle(CCR_V, ((_notLimitedResult >> (48 + g_aluShift)) ^
+				(_result.var >> (48 + g_aluShift))) & 255);
 		}
 
 		void setSR(const TReg24& _sr)
@@ -647,6 +662,18 @@ namespace dsp56k
 		static void		aluMask			(TReg56& _v)					{ _v.var &= ~static_cast<TReg56::MyType>(0xff); }
 		static TReg56::MyType aluSignextend(const TReg56& _v)		{ return _v.var; }
 
+		// SA arithmetic concatenates EXT:MSP:LSP into 40 bits. Keep its sign at bit 63
+		// while calculating, then restore the architectural gaps (FM 3.4.2).
+		uint64_t arithmeticValue(const TReg56& _v) const
+		{
+			const auto v = static_cast<uint64_t>(_v.var);
+			return isSixteenBitArithmetic() ? (v & 0xffffff0000000000ull) | ((v & 0xffff0000ull) << 8) : v;
+		}
+		void arithmeticResult(TReg56& _dst, uint64_t _v) const
+		{
+			_dst.var = isSixteenBitArithmetic() ? (_v & 0xffffff0000000000ull) | ((_v >> 8) & 0xffff0000ull) : (_v & ~0xffull);
+		}
+
 		// builds an ALU operand in the left-aligned domain from a right-aligned source
 		template<typename T> static TReg56 toAluOperand(const T& _src)	{ TReg56 r; convert(r, _src); r.var <<= g_aluShift; return r; }
 
@@ -681,6 +708,7 @@ namespace dsp56k
 
 		template<typename T> T getA()
 		{
+			sr_s_update();
 			TReg56 temp = reg.a;
 			scale( temp );
 			T res;
@@ -690,6 +718,7 @@ namespace dsp56k
 
 		template<typename T> T getB()
 		{
+			sr_s_update();
 			TReg56 temp(reg.b);
 			scale(temp);
 			T res;
@@ -697,14 +726,26 @@ namespace dsp56k
 			return res;
 		}
 
-		void scale( TReg56& _scale ) const
+		void scale(TReg56& _scale) const
 		{
-			if( sr_test_noCache(SR_S1) )
-				_scale.var <<= 1;
-			else if( sr_test_noCache(SR_S0) )
-				_scale.var >>= 1;
+			if(isSixteenBitArithmetic())
+			{
+				auto value = arithmeticValue(_scale);
+				if(sr_test_noCache(SR_S1))
+				{
+					// Transfer limiting preserves the source sign, including scaler overflow.
+					const auto signedValue = static_cast<int64_t>(value);
+					if(signedValue > 0x3fffffffffffffffll) value = 0x7fffffffff000000ull;
+					else if(signedValue < -0x4000000000000000ll) value = 0x8000000000000000ull;
+					else value <<= 1;
+				}
+				else if(sr_test_noCache(SR_S0)) value = static_cast<int64_t>(value) >> 1;
+				arithmeticResult(_scale, value);
+				return;
+			}
+			if(sr_test_noCache(SR_S1)) _scale.var <<= 1;
+			else if(sr_test_noCache(SR_S0)) _scale.var >>= 1;
 		}
-
 		void limit_transfer( int& _dst, const TReg56& _src )
 		{
 			// left-aligned the value is already sign-correct in 64 bits, no sign extension needed
@@ -758,25 +799,18 @@ namespace dsp56k
 			limit_transfer( reinterpret_cast<int&>(_dst), _src );
 		}
 
-		void limit_arithmeticSaturation( TReg56& _dst )
+		void limit_arithmeticSaturation(TReg56& _dst, bool _rounded = false)
 		{
-			if( !sr_test_noCache(SR_SM) )
-				return;
-
-			const auto v = (bitvalue( _dst, 55 + g_aluShift ).bit << 2) | (bitvalue( _dst, 48 + g_aluShift ).bit << 1) | bitvalue(_dst, 47 + g_aluShift).bit;
-
-			switch( v )
-			{
-			case 0:
-			case 7:	/* do nothing */								break;
-			case 1:
-			case 2:
-			case 3:	_dst.var = 0x007fffffffffffll << g_aluShift;	sr_set(CCR_V);	break;
-			case 4:
-			case 5:
-			case 6: _dst.var = static_cast<TReg56::MyType>(0xff800000000000ull << g_aluShift);	sr_set(CCR_V);	break;
-			default: assert( 0 && "impossible" );
-			}
+			if(!sr_test_noCache(SR_SM)) return;
+			// FM table 3-1 checks EXT[7], EXT[0], MSP[23], after rounding.
+			const auto sign = static_cast<int64_t>(_dst.var) >> 63;
+			const bool saturate = ((static_cast<uint64_t>(_dst.var) >> (47 + g_aluShift)) ^ sign) & 3;
+			sr_toggle(CCR_V, saturate);
+			if(!saturate) return;
+			uint64_t positive = isSixteenBitArithmetic() ? 0x007fff00ffff00ull : 0x007fffffffffffull;
+			if(_rounded) positive &= ~0xffffffull;
+			_dst.var = (sign ? 0xff800000000000ull : positive) << g_aluShift;
+			sr_set(CCR_L);
 		}
 
 		TReg8	ccr				() const							{ return byte0(getSR()); }
@@ -818,11 +852,11 @@ namespace dsp56k
 			return _reg;
 		}
 
-		// 48-bit ALU operand (X or Y) in 16-bit mode: X1[23..8] -> bits 47..32, X0[23..8] -> bits 31..16
+		// 48-bit ALU operand (X or Y) in 16-bit mode: X1[23..8] -> bits 47..32, X0[23..8] -> bits 23..8
 		static TReg56::MyType xyTo56SixteenBit(const TReg48& _xy)
 		{
 			const auto v = static_cast<uint64_t>(_xy.var);
-			const auto res = (v & 0xffff00000000ull) | ((v & 0xffff00ull) << 8);
+			const auto res = (v & 0xffff00000000ull) | (v & 0xffff00ull);
 			return static_cast<TReg56::MyType>(res | ((res & 0x800000000000ull) ? 0xff000000000000ull : 0));
 		}
 
@@ -862,7 +896,7 @@ namespace dsp56k
 			{
 				const auto hi = static_cast<TWord>(test >> (32 + g_aluShift)) & 0xffff;
 				_x = hi | ((hi & 0x8000) ? 0xff0000 : 0);
-				_y = static_cast<TWord>(test >> (16 + g_aluShift)) & 0xffff;
+				_y = static_cast<TWord>(test >> (8 + g_aluShift)) & 0xffff;
 			}
 		}
 
@@ -871,7 +905,7 @@ namespace dsp56k
 		{
 			const auto hi = static_cast<uint64_t>(_x.toWord() & 0xffff);
 			const auto lo = static_cast<uint64_t>(_y.toWord() & 0xffff);
-			auto res = (hi << 32) | (lo << 16);
+			auto res = (hi << 32) | (lo << 8);
 			if(hi & 0x8000)
 				res |= 0xff000000000000ull;
 			return static_cast<TReg56::MyType>(res);
@@ -929,15 +963,16 @@ namespace dsp56k
 		void	alu_lsl				( bool ab, int _shiftAmount );
 		void	alu_lsr				( bool ab, int _shiftAmount );
 
+		void alu_shiftedArithmetic(bool ab, bool _left, bool _subtract);
 		void	alu_addl			(bool ab);
 		void	alu_addr			(bool ab);
 
-		void	alu_rol				(bool ab);
+		void alu_rotate(bool ab, bool _right);
 
 		void	alu_clr				(bool ab);
 		
 		TWord	alu_bclr			( TWord _bit, TWord _val );
-		void	alu_mpy				( bool ab, const TReg24& _s1, const TReg24& _s2, bool _negate, bool _accumulate );
+		void	alu_mpy				( bool ab, const TReg24& _s1, const TReg24& _s2, bool _negate, bool _accumulate, bool _round = false );
 		void	alu_mpysuuu			( bool ab, TReg24 _s1, TReg24 _s2, bool _negate, bool _accumulate, bool _suuu );
 		void	alu_dmac			( bool ab, TReg24 _s1, TReg24 _s2, bool _negate, bool srcUnsigned, bool dstUnsigned );
 		void	alu_mac				( bool ab, TReg24 _s1, TReg24 _s2, bool _negate, bool _uu );

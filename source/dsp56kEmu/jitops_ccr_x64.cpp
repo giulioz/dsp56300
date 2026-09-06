@@ -73,6 +73,32 @@ namespace dsp56k
 		ccr_update(_bit, asmjit::x86::CondCode::kLE);
 	}
 
+	void JitOps::ccr_updateArithmeticFlags(bool /*_subtract*/)
+	{
+		// C was cleared before ADD/SUB; V may retain preceding shift overflow.
+		// Capture OF before ADC/OR change
+		// the host flags; L is sticky and receives the same overflow condition.
+		assert(!m_ccr_update_clear);
+		const auto sr = m_dspRegs.getSR(JitDspRegs::ReadWrite);
+		if(isArithmeticSaturation())
+		{
+			// SM derives V/L from the saturation table after the full operation.
+			m_asm.adc(sr.r8(), asmjit::Imm(0));
+			ccr_clearDirty(CCR_C);
+			m_ccrWritten |= CCR_C;
+			return;
+		}
+		const RegScratch overflow(m_block);
+		m_asm.set(asmjit::x86::CondCode::kO, overflow.r8());
+		m_asm.adc(sr.r8(), asmjit::Imm(0));
+		m_asm.shl(overflow.r8(), asmjit::Imm(CCRB_V));
+		m_asm.or_(sr.r8(), overflow.r8());
+		m_asm.shl(overflow.r8(), asmjit::Imm(CCRB_L - CCRB_V));
+		m_asm.or_(sr.r8(), overflow.r8());
+		ccr_clearDirty(static_cast<CCRMask>(CCR_C | CCR_V | CCR_L));
+		m_ccrWritten |= CCR_C | CCR_V | CCR_L;
+	}
+
 	void JitOps::ccr_update_ifCarry(CCRBit _bit)
 	{
 		// set reg to 1 if last operation generated carry, 0 otherwise
@@ -298,61 +324,13 @@ namespace dsp56k
 		copyBitToCCR(_alu, 23 + g_aluBitOffset, CCRB_N);
 	}
 
-	void JitOps::ccr_s_update(const JitReg64& _alu)
-	{
-		const auto exit = m_asm.newLabel();
-
-		m_asm.bitTest(m_dspRegs.getSR(JitDspRegs::Read), CCRB_S);
-		m_asm.jnz(exit);
-
-		const auto* mode = m_block.getMode();
-
-		if(mode)
-		{
-			uint32_t bit = 46 + g_aluBitOffset + (mode->testSR(SRB_S1) ? 1 : 0) - (mode->testSR(SRB_S0) ? 1 : 0);
-
-			const RegGP bit46(m_block);
-			m_asm.copyBitToReg(bit46, _alu, bit);
-
-			const RegGP temp(m_block);
-			m_asm.copyBitToReg(temp, _alu, bit - 1);
-
-			m_asm.xor_(temp, bit46.get());
-
-			ccr_update(temp, CCRB_S);
-		}
-		else
-		{
-			const RegGP bit(m_block);
-			m_asm.mov(bit, asmjit::Imm(46 + g_aluBitOffset));
-
-			{
-				const RegGP s0s1(m_block);
-				m_asm.clr(s0s1);
-				sr_getBitValue(s0s1, SRB_S1);
-				m_asm.add(bit, s0s1.get());
-
-				sr_getBitValue(s0s1, SRB_S0);
-				m_asm.sub(bit, s0s1.get());
-			}
-
-			const RegGP bit46(m_block);
-			m_asm.bt(_alu, bit.get());
-			m_asm.setc(bit46.get().r8());
-
-			m_asm.dec(bit);
-			m_asm.bt(_alu, bit.get());
-			m_asm.setc(bit.get().r8());
-			m_asm.xor_(bit, bit46.get());
-
-			ccr_update(bit, CCRB_S);
-		}
-
-		m_asm.bind(exit);
-	}
 
 	void JitOps::ccr_vl_update(const asmjit::x86::CondCode _cc)
 	{
+		// Capture the host condition before clearing V, which modifies EFLAGS.
+		const RegScratch r(m_block);
+		m_asm.set(_cc, r.get().r8());
+
 		// V has to be cleared first because it is overwritten; L must NOT be, it is sticky.
 		if(m_ccr_update_clear)
 			ccr_clear(CCR_V);
@@ -362,8 +340,6 @@ namespace dsp56k
 
 		// 0/1 -> 0x00/0xFF -> 0x00/(CCR_V|CCR_L), so one OR writes both bits. The per-bit path needs
 		// set+shl+or for V and then rol+and+or to copy V into L, six instructions instead of four.
-		const RegScratch r(m_block);
-		m_asm.set(_cc, r.get().r8());
 		m_asm.neg(r.get().r8());
 		m_asm.and_(r.get().r8(), asmjit::Imm(CCR_V | CCR_L));
 		m_asm.or_(m_dspRegs.getSR(JitDspRegs::ReadWrite).r8(), r.get().r8());
