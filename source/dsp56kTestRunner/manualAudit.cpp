@@ -571,7 +571,7 @@ namespace
 								const std::string instruction = std::string(absolute ? "abs " : "neg ") + (destinationB ? "b" : "a");
 								const auto pc = rig.emit(0x2c0, instruction); rig.emit(pc, "jmp $ff0");
 								rig.dsp.writeReg(destinationB ? Reg_B : Reg_A,
-									TReg56(sa ? packSA(value) | 0x5a0000aaull : value));
+									TReg56(static_cast<TReg56::MyType>(sa ? packSA(value) | 0x5a0000aaull : value)));
 								rig.start(0x2c0, 0x300 | (sa ? SR_SA : 0) | (sm ? SR_SM : 0) | CCR_C | CCR_V |
 									(sticky ? CCR_L : 0)); rig.run();
 								TReg56 result; rig.dsp.readReg(destinationB ? Reg_B : Reg_A, result);
@@ -637,8 +637,8 @@ namespace
 		// FM table 5-1: S is sticky and observes both accumulators when an
 		// accumulator is moved to XDB/YDB, using the pre-scaling value.
 		for(TWord scaling : {TWord(0), TWord(SR_S0), TWord(SR_S1)})
-			for(uint64_t a : {uint64_t(0), 0x00400000000000ull})
-				for(uint64_t b : {uint64_t(0), 0x00400000000000ull})
+			for(uint64_t a : {uint64_t(0), uint64_t(0x00400000000000)})
+				for(uint64_t b : {uint64_t(0), uint64_t(0x00400000000000)})
 					for(bool sticky : {false, true})
 					{
 						const unsigned bit = scaling == SR_S0 ? 45 : scaling == SR_S1 ? 47 : 46;
